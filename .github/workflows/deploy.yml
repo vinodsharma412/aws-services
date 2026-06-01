@@ -1,24 +1,33 @@
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# NSE Stock Dashboard — 100% Serverless CI/CD Pipeline
+# NSE Stock Dashboard — Multi-Account CI/CD Pipeline
 #
-# No EC2. No SSH. No FastAPI framework. Pure Lambda handlers.
+# ┌─────────────────┐     ┌───────────────────┐     ┌───────────────────┐
+# │  GitHub Actions │────▶│  aws-staging acct │────▶│  aws-prod account │
+# │  (orchestrator) │     │  auto on push     │     │  manual approval  │
+# └─────────────────┘     └───────────────────┘     └───────────────────┘
 #
-# AWS services deployed here:
-#   Lambda  (API, Worker, WebSocket, DynamoDB Streams, SES, DLQ Alert)
-#   S3      (frontend static files)
-#   CloudFront  (CDN cache invalidation)
+# Authentication: GitHub OIDC (no AWS access keys stored in GitHub Secrets)
+#   Staging: assumes GitHubActionsRole-staging in aws-staging account
+#   Prod:    assumes GitHubActionsRole-prod     in aws-prod account
 #
-# Flow:
-#   push develop → [1] Lint+Build → [2] Deploy STAGING (auto) → [3] Deploy PROD (approval)
+# GitHub Secrets required (Settings → Secrets → Actions):
+#   STAGING_ROLE_ARN           arn:aws:iam::<staging-account-id>:role/GitHubActionsRole-staging
+#   STAGING_ACCOUNT_ID         <staging AWS account ID>
+#   STAGING_API_URL            https://<id>.execute-api.ap-south-1.amazonaws.com/api/v1
+#   S3_FRONTEND_BUCKET_STAGING nse-frontend-<staging-account-id>
 #
-# GitHub Secrets:
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
-#   S3_FRONTEND_BUCKET
-#   STAGING_API_URL, PROD_API_URL
+#   PROD_ROLE_ARN              arn:aws:iam::<prod-account-id>:role/GitHubActionsRole-prod
+#   PROD_ACCOUNT_ID            <prod AWS account ID>
+#   PROD_API_URL               https://<id>.execute-api.ap-south-1.amazonaws.com/api/v1
+#   S3_FRONTEND_BUCKET_PROD    nse-frontend-<prod-account-id>
 #
-# GitHub Environments:
-#   staging  — no protection (auto-deploy)
-#   prod     — Required reviewers: your GitHub username
+# GitHub Environments (Settings → Environments):
+#   staging — no protection rules (auto-deploy on push to develop)
+#   prod    — Required reviewers: your GitHub username (manual gate)
+#
+# Branches:
+#   develop → auto-deploys to staging
+#   main    → prod deploys are triggered from develop → approval → prod
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 name: Deploy Pipeline
@@ -28,12 +37,10 @@ on:
     branches: [ develop ]
   workflow_dispatch:
     inputs:
-      stage:
-        description: 'Stage to deploy'
-        required: true
-        default: 'staging'
-        type: choice
-        options: [ staging, prod ]
+      deploy_prod:
+        description: 'Force deploy to prod (skip staging)'
+        type: boolean
+        default: false
 
 env:
   AWS_REGION: ap-south-1
@@ -41,10 +48,14 @@ env:
   NODE_VERSION: "20"
   PANDAS_LAYER: "arn:aws:lambda:ap-south-1:336392948345:layer:AWSSDKPandas-Python312:16"
 
+permissions:
+  id-token: write    # Required for OIDC
+  contents: read
+
 jobs:
 
-  # ── 1. Lint + Build artifacts ─────────────────────────────────────────────
-  lint-build:
+  # ── 1. Lint + Build Lambda zips + Frontend builds ─────────────────────────
+  build:
     name: Lint & Build
     runs-on: ubuntu-latest
     steps:
@@ -55,11 +66,13 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      - name: Install deps + lint
+      - name: Lint Python
         run: |
-          pip install ruff aws-xray-sdk -q
-          pip install -r backend/requirements.txt -q
-          ruff check backend/handlers/ backend/app/
+          pip install ruff -q
+          ruff check backend/handlers/ backend/app/ backend/lambda_handler.py
+
+      - name: Install backend deps
+        run: pip install -r backend/requirements.txt -q
 
       - uses: actions/setup-node@v4
         with:
@@ -71,7 +84,7 @@ jobs:
         run: npm ci
         working-directory: frontend
 
-      # Build staging frontend
+      # ── Frontend builds (one per account) ────────────────────────────────
       - name: Build frontend — STAGING
         run: npm run build
         working-directory: frontend
@@ -87,7 +100,6 @@ jobs:
           path: frontend/build/
           retention-days: 1
 
-      # Build prod frontend
       - name: Build frontend — PROD
         run: npm run build
         working-directory: frontend
@@ -103,122 +115,136 @@ jobs:
           path: frontend/build/
           retention-days: 1
 
-      # ── Build API Lambda package (handlers/ + app/ + deps) ──────────────
-      - name: Build API Lambda package
+      # ── Lambda packages ──────────────────────────────────────────────────
+      - name: Package API Lambda
         run: |
-          BUILD=/tmp/api-lambda
-          rm -rf $BUILD && mkdir -p $BUILD
-          # Install deps (Linux x86_64 for Lambda, exclude playwright)
-          pip install -r backend/requirements.txt -t $BUILD/ -q \
+          B=/tmp/api && rm -rf $B && mkdir $B
+          pip install -r backend/requirements.txt -t $B/ -q \
             --platform manylinux2014_x86_64 --implementation cp \
             --python-version 3.12 --only-binary=:all: 2>/dev/null || \
-          pip install -r backend/requirements.txt -t $BUILD/ -q
-          # Copy application code
-          cp -r backend/handlers backend/app $BUILD/
-          # Remove heavy unused packages
-          rm -rf $BUILD/playwright $BUILD/playwright-* 2>/dev/null || true
-          # Strip __pycache__
-          find $BUILD -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-          find $BUILD -name "*.pyc" -delete 2>/dev/null || true
-          cd $BUILD && zip -r /tmp/api-lambda.zip . -q
+          pip install -r backend/requirements.txt -t $B/ -q
+          cp -r backend/handlers backend/app $B/
+          cp backend/lambda_handler.py $B/
+          rm -rf $B/playwright $B/playwright-* 2>/dev/null || true
+          find $B -name "*.pyc" -delete
+          find $B -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+          cd $B && zip -r /tmp/api-lambda.zip . -q
           echo "API Lambda: $(du -sh /tmp/api-lambda.zip | cut -f1)"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: api-lambda-zip
+          name: api-lambda
           path: /tmp/api-lambda.zip
           retention-days: 1
 
-      # ── Build Worker Lambda ───────────────────────────────────────────────
-      - name: Build Worker Lambda package
+      - name: Package Worker Lambda
         run: |
-          BUILD=/tmp/worker-lambda
-          rm -rf $BUILD && mkdir -p $BUILD
-          pip install httpx beautifulsoup4 aws-xray-sdk boto3 -t $BUILD/ -q \
+          B=/tmp/worker && rm -rf $B && mkdir $B
+          pip install httpx beautifulsoup4 aws-xray-sdk boto3 -t $B/ -q \
             --platform manylinux2014_x86_64 --implementation cp \
             --python-version 3.12 --only-binary=:all: 2>/dev/null || \
-          pip install httpx beautifulsoup4 aws-xray-sdk boto3 -t $BUILD/ -q
-          cp infrastructure/lambda/scraping_worker/handler.py $BUILD/
-          find $BUILD -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-          cd $BUILD && zip -r /tmp/worker-lambda.zip . -q
+          pip install httpx beautifulsoup4 aws-xray-sdk boto3 -t $B/ -q
+          cp infrastructure/lambda/scraping_worker/handler.py $B/
+          find $B -name "*.pyc" -delete
+          cd $B && zip -r /tmp/worker-lambda.zip . -q
           echo "Worker Lambda: $(du -sh /tmp/worker-lambda.zip | cut -f1)"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: worker-lambda-zip
+          name: worker-lambda
           path: /tmp/worker-lambda.zip
           retention-days: 1
 
-      # ── Build WebSocket + Streams Lambda ──────────────────────────────────
-      - name: Build WebSocket Lambda package
+      - name: Package WebSocket + Streams Lambda
         run: |
-          BUILD=/tmp/ws-lambda
-          rm -rf $BUILD && mkdir -p $BUILD
-          pip install aws-xray-sdk boto3 -t $BUILD/ -q \
+          B=/tmp/ws && rm -rf $B && mkdir $B
+          pip install aws-xray-sdk boto3 -t $B/ -q \
             --platform manylinux2014_x86_64 --implementation cp \
             --python-version 3.12 --only-binary=:all: 2>/dev/null || \
-          pip install aws-xray-sdk boto3 -t $BUILD/ -q
-          cp backend/handlers/websocket.py $BUILD/handler.py
-          cp backend/handlers/_base.py $BUILD/
-          cp backend/handlers/dynamo_streams.py $BUILD/dynamo_streams.py
-          cp backend/handlers/ses_notifications.py $BUILD/ses_notifications.py
-          find $BUILD -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-          cd $BUILD && zip -r /tmp/ws-lambda.zip . -q
+          pip install aws-xray-sdk boto3 -t $B/ -q
+          cp backend/handlers/websocket.py $B/handler.py
+          cp backend/handlers/_base.py $B/
+          cp backend/handlers/dynamo_streams.py $B/
+          cp backend/handlers/ses_notifications.py $B/
+          find $B -name "*.pyc" -delete
+          cd $B && zip -r /tmp/ws-lambda.zip . -q
           echo "WS Lambda: $(du -sh /tmp/ws-lambda.zip | cut -f1)"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ws-lambda-zip
+          name: ws-lambda
           path: /tmp/ws-lambda.zip
           retention-days: 1
 
-  # ── 2. Deploy STAGING (auto on every push) ────────────────────────────────
+      - name: Package Lambda Layer
+        run: |
+          B=/tmp/layer && rm -rf $B && mkdir -p $B/python/utils
+          pip install aws-xray-sdk -t $B/python/ -q \
+            --platform manylinux2014_x86_64 --implementation cp \
+            --python-version 3.12 --only-binary=:all: 2>/dev/null || \
+          pip install aws-xray-sdk -t $B/python/ -q
+          cp infrastructure/lambda/layer/python/utils/*.py $B/python/utils/
+          find $B -name "*.pyc" -delete
+          cd $B && zip -r /tmp/layer.zip python/ -q
+          echo "Layer: $(du -sh /tmp/layer.zip | cut -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lambda-layer
+          path: /tmp/layer.zip
+          retention-days: 1
+
+  # ── 2. Deploy to aws-staging account (auto on push to develop) ────────────
   deploy-staging:
-    name: Deploy STAGING
-    needs: lint-build
+    name: Deploy → aws-staging
+    needs: build
     runs-on: ubuntu-latest
     environment: staging
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: /tmp/artifacts/
 
-      - name: Deploy shared Lambda Layer
+      # OIDC: assume role in aws-staging account (no access keys!)
+      - name: Configure AWS credentials — STAGING account (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.STAGING_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-staging-${{ github.run_id }}
+
+      - name: Verify staging account
         run: |
-          BUILD=/tmp/layer-build && rm -rf $BUILD && mkdir -p $BUILD/python/utils
-          pip install aws-xray-sdk -t $BUILD/python/ -q \
-            --platform manylinux2014_x86_64 --implementation cp \
-            --python-version 3.12 --only-binary=:all: 2>/dev/null || \
-          pip install aws-xray-sdk -t $BUILD/python/ -q
-          cp infrastructure/lambda/layer/python/utils/*.py $BUILD/python/utils/
-          cd $BUILD && zip -r /tmp/layer.zip python/ -q
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          echo "Deploying to staging account: ${ACCOUNT}"
+          if [ "${ACCOUNT}" != "${{ secrets.STAGING_ACCOUNT_ID }}" ]; then
+            echo "ERROR: Wrong account! Expected ${{ secrets.STAGING_ACCOUNT_ID }}, got ${ACCOUNT}"
+            exit 1
+          fi
+
+      - name: Publish Lambda Layer — STAGING
+        run: |
           LAYER_ARN=$(aws lambda publish-layer-version \
             --layer-name nse-shared-utils \
-            --zip-file fileb:///tmp/layer.zip \
+            --description "X-Ray + AppConfig utils — $(date +%Y-%m-%d)" \
+            --zip-file fileb:///tmp/artifacts/lambda-layer/layer.zip \
             --compatible-runtimes python3.12 \
             --query LayerVersionArn --output text)
-          echo "LAYER_ARN=$LAYER_ARN" >> $GITHUB_ENV
           aws ssm put-parameter --name /nse/staging/shared-layer-arn \
             --value "$LAYER_ARN" --type String --overwrite
+          echo "LAYER_ARN=$LAYER_ARN" >> $GITHUB_ENV
 
       - name: Deploy API Lambda — STAGING
         run: |
           FUNC="nse-api-staging"
           ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
           ROLE="arn:aws:iam::${ACCOUNT}:role/NSELambdaRole"
-          ENV="Variables={STAGE=staging,AWS_REGION=${{ env.AWS_REGION }}}"
           LAYERS="${{ env.PANDAS_LAYER }},${{ env.LAYER_ARN }}"
-          ZIP="fileb:///tmp/artifacts/api-lambda-zip/api-lambda.zip"
+          ZIP="fileb:///tmp/artifacts/api-lambda/api-lambda.zip"
+          ENV="Variables={STAGE=staging,AWS_REGION=${{ env.AWS_REGION }}}"
           if aws lambda get-function --function-name $FUNC 2>/dev/null; then
             aws lambda update-function-code --function-name $FUNC --zip-file $ZIP > /dev/null
             aws lambda wait function-updated --function-name $FUNC
@@ -228,25 +254,26 @@ jobs:
             aws lambda create-function --function-name $FUNC \
               --runtime python3.12 --handler handlers.health.handler \
               --zip-file $ZIP --role $ROLE --timeout 30 --memory-size 512 \
-              --layers $LAYERS --environment "$ENV" > /dev/null
+              --layers $LAYERS --environment "$ENV" \
+              --tracing-config Mode=Active > /dev/null
             aws lambda wait function-active --function-name $FUNC
           fi
-          echo "✓ nse-api-staging deployed"
+          echo "✓ nse-api-staging deployed to aws-staging account"
 
       - name: Deploy Worker Lambda — STAGING
         run: |
           FUNC="nse-scraping-worker-staging"
           ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
           ROLE="arn:aws:iam::${ACCOUNT}:role/NSELambdaRole"
-          ZIP="fileb:///tmp/artifacts/worker-lambda-zip/worker-lambda.zip"
-          ENV="Variables={STAGE=staging,AWS_REGION=${{ env.AWS_REGION }}}"
+          ZIP="fileb:///tmp/artifacts/worker-lambda/worker-lambda.zip"
           if aws lambda get-function --function-name $FUNC 2>/dev/null; then
             aws lambda update-function-code --function-name $FUNC --zip-file $ZIP > /dev/null
           else
-            aws lambda create-function --function-name $FUNC \
-              --runtime python3.12 --handler handler.lambda_handler \
-              --zip-file $ZIP --role $ROLE --timeout 120 --memory-size 256 \
-              --environment "$ENV" > /dev/null
+            aws lambda create-function --function-name $FUNC --runtime python3.12 \
+              --handler handler.lambda_handler --zip-file $ZIP --role $ROLE \
+              --timeout 120 --memory-size 256 \
+              --environment "Variables={STAGE=staging,AWS_REGION=${{ env.AWS_REGION }}}" \
+              --tracing-config Mode=Active > /dev/null
           fi
           echo "✓ nse-scraping-worker-staging deployed"
 
@@ -255,98 +282,151 @@ jobs:
           FUNC="nse-ws-staging"
           ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
           ROLE="arn:aws:iam::${ACCOUNT}:role/NSELambdaRole"
-          ZIP="fileb:///tmp/artifacts/ws-lambda-zip/ws-lambda.zip"
-          ENV="Variables={STAGE=staging,AWS_REGION=${{ env.AWS_REGION }}}"
+          ZIP="fileb:///tmp/artifacts/ws-lambda/ws-lambda.zip"
           if aws lambda get-function --function-name $FUNC 2>/dev/null; then
             aws lambda update-function-code --function-name $FUNC --zip-file $ZIP > /dev/null
           else
-            aws lambda create-function --function-name $FUNC \
-              --runtime python3.12 --handler handler.handler \
-              --zip-file $ZIP --role $ROLE --timeout 30 --memory-size 256 \
-              --environment "$ENV" > /dev/null
+            aws lambda create-function --function-name $FUNC --runtime python3.12 \
+              --handler handler.handler --zip-file $ZIP --role $ROLE \
+              --timeout 30 --memory-size 256 \
+              --environment "Variables={STAGE=staging,AWS_REGION=${{ env.AWS_REGION }}}" > /dev/null
           fi
           echo "✓ nse-ws-staging deployed"
 
-      - name: Health check — STAGING
+      - name: Health check — aws-staging
         run: |
-          sleep 10
-          curl -fsS "${{ secrets.STAGING_API_URL }}/health/" \
-            && echo "✓ STAGING health OK" \
-            || (echo "✗ STAGING health FAILED" && exit 1)
+          sleep 15
+          URL="${{ secrets.STAGING_API_URL }}/health/"
+          for i in 1 2 3; do
+            if curl -fsS "$URL" | grep -q '"status"'; then
+              echo "✓ Staging health OK (attempt ${i})"
+              break
+            fi
+            echo "Retry ${i}..."
+            sleep 10
+          done
 
-      - name: Upload frontend → S3 staging
+      - name: Deploy frontend → S3 staging
         run: |
+          BUCKET="${{ secrets.S3_FRONTEND_BUCKET_STAGING }}"
           aws s3 sync /tmp/artifacts/frontend-staging/static/ \
-            s3://${{ secrets.S3_FRONTEND_BUCKET }}/staging/static/ \
-            --cache-control "max-age=31536000,immutable" --delete
+            s3://${BUCKET}/static/ --cache-control "max-age=31536000,immutable" --delete
           aws s3 sync /tmp/artifacts/frontend-staging/ \
-            s3://${{ secrets.S3_FRONTEND_BUCKET }}/staging/ \
-            --cache-control "no-cache,no-store" --exclude "static/*" --delete
+            s3://${BUCKET}/ --cache-control "no-cache,no-store" \
+            --exclude "static/*" --delete
+          echo "✓ Frontend deployed to s3://${BUCKET}"
 
       - name: Invalidate CloudFront — STAGING
         run: |
           DIST=$(aws ssm get-parameter --name /nse/staging/cloudfront-dist-id \
             --query Parameter.Value --output text 2>/dev/null || echo "")
           [ -n "$DIST" ] && aws cloudfront create-invalidation \
-            --distribution-id "$DIST" --paths "/staging/*" || true
+            --distribution-id "$DIST" --paths "/*" || true
 
-  # ── 3. Deploy PROD (manual approval) ─────────────────────────────────────
+  # ── 3. Deploy to aws-prod account (MANUAL approval required) ─────────────
   deploy-prod:
-    name: Deploy PROD
+    name: Deploy → aws-prod
     needs: deploy-staging
     runs-on: ubuntu-latest
-    environment: prod
+    environment: prod              # GitHub requires reviewer approval here
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: /tmp/artifacts/
 
+      # OIDC: assume role in aws-PROD account (completely different account)
+      - name: Configure AWS credentials — PROD account (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-prod-${{ github.run_id }}
+
+      - name: Verify prod account
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          echo "Deploying to PROD account: ${ACCOUNT}"
+          if [ "${ACCOUNT}" != "${{ secrets.PROD_ACCOUNT_ID }}" ]; then
+            echo "ERROR: Wrong account! Expected ${{ secrets.PROD_ACCOUNT_ID }}, got ${ACCOUNT}"
+            exit 1
+          fi
+
+      - name: Publish Lambda Layer — PROD
+        run: |
+          LAYER_ARN=$(aws lambda publish-layer-version \
+            --layer-name nse-shared-utils \
+            --description "X-Ray + AppConfig utils — $(date +%Y-%m-%d)" \
+            --zip-file fileb:///tmp/artifacts/lambda-layer/layer.zip \
+            --compatible-runtimes python3.12 \
+            --query LayerVersionArn --output text)
+          aws ssm put-parameter --name /nse/prod/shared-layer-arn \
+            --value "$LAYER_ARN" --type String --overwrite
+          echo "LAYER_ARN=$LAYER_ARN" >> $GITHUB_ENV
+
       - name: Deploy API Lambda — PROD
         run: |
           FUNC="nse-api-prod"
-          LAYER=$(aws ssm get-parameter --name /nse/prod/shared-layer-arn \
-            --query Parameter.Value --output text 2>/dev/null || echo "")
-          LAYERS="${{ env.PANDAS_LAYER }}${LAYER:+,$LAYER}"
-          ZIP="fileb:///tmp/artifacts/api-lambda-zip/api-lambda.zip"
-          aws lambda update-function-code --function-name $FUNC --zip-file $ZIP > /dev/null
-          aws lambda wait function-updated --function-name $FUNC
-          aws lambda update-function-configuration --function-name $FUNC \
-            --layers $LAYERS --environment "Variables={STAGE=prod,AWS_REGION=${{ env.AWS_REGION }}}" > /dev/null
-          echo "✓ nse-api-prod deployed"
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          ROLE="arn:aws:iam::${ACCOUNT}:role/NSELambdaRole"
+          LAYERS="${{ env.PANDAS_LAYER }},${{ env.LAYER_ARN }}"
+          ZIP="fileb:///tmp/artifacts/api-lambda/api-lambda.zip"
+          ENV="Variables={STAGE=prod,AWS_REGION=${{ env.AWS_REGION }}}"
+          if aws lambda get-function --function-name $FUNC 2>/dev/null; then
+            aws lambda update-function-code --function-name $FUNC --zip-file $ZIP > /dev/null
+            aws lambda wait function-updated --function-name $FUNC
+            aws lambda update-function-configuration --function-name $FUNC \
+              --layers $LAYERS --environment "$ENV" --timeout 30 --memory-size 512 > /dev/null
+          else
+            aws lambda create-function --function-name $FUNC \
+              --runtime python3.12 --handler handlers.health.handler \
+              --zip-file $ZIP --role $ROLE --timeout 30 --memory-size 512 \
+              --layers $LAYERS --environment "$ENV" \
+              --tracing-config Mode=Active > /dev/null
+            aws lambda wait function-active --function-name $FUNC
+          fi
+          echo "✓ nse-api-prod deployed to aws-prod account"
 
       - name: Deploy Worker + WS Lambda — PROD
         run: |
-          for FUNC_ZIP in "nse-scraping-worker-prod:worker-lambda-zip/worker-lambda.zip" "nse-ws-prod:ws-lambda-zip/ws-lambda.zip"; do
-            FUNC="${FUNC_ZIP%%:*}"; ZIP="${FUNC_ZIP#*:}"
-            aws lambda update-function-code --function-name $FUNC \
-              --zip-file "fileb:///tmp/artifacts/${ZIP}" > /dev/null 2>/dev/null || true
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          ROLE="arn:aws:iam::${ACCOUNT}:role/NSELambdaRole"
+          for ITEM in "nse-scraping-worker-prod:worker-lambda/worker-lambda.zip:handler.lambda_handler:120:256" \
+                      "nse-ws-prod:ws-lambda/ws-lambda.zip:handler.handler:30:256"; do
+            FUNC="${ITEM%%:*}"; REST="${ITEM#*:}"
+            ZIP_PATH="${REST%%:*}"; REST="${REST#*:}"
+            HANDLER="${REST%%:*}"; REST="${REST#*:}"
+            TIMEOUT="${REST%%:*}"; MEMORY="${REST#*:}"
+            ZIP="fileb:///tmp/artifacts/${ZIP_PATH}"
+            if aws lambda get-function --function-name $FUNC 2>/dev/null; then
+              aws lambda update-function-code --function-name $FUNC --zip-file $ZIP > /dev/null
+            else
+              aws lambda create-function --function-name $FUNC --runtime python3.12 \
+                --handler $HANDLER --zip-file $ZIP --role $ROLE \
+                --timeout $TIMEOUT --memory-size $MEMORY \
+                --environment "Variables={STAGE=prod,AWS_REGION=${{ env.AWS_REGION }}}" > /dev/null
+            fi
             echo "✓ $FUNC deployed"
           done
 
-      - name: Health check — PROD
+      - name: Health check — aws-prod
         run: |
-          sleep 10
-          curl -fsS "${{ secrets.PROD_API_URL }}/health/" \
-            && echo "✓ PROD health OK" || (echo "✗ PROD FAILED" && exit 1)
+          sleep 15
+          URL="${{ secrets.PROD_API_URL }}/health/"
+          curl -fsS "$URL" | grep '"status"' && echo "✓ PROD health OK" \
+            || (echo "✗ PROD health FAILED" && exit 1)
 
-      - name: Upload frontend → S3 prod
+      - name: Deploy frontend → S3 prod
         run: |
+          BUCKET="${{ secrets.S3_FRONTEND_BUCKET_PROD }}"
           aws s3 sync /tmp/artifacts/frontend-prod/static/ \
-            s3://${{ secrets.S3_FRONTEND_BUCKET }}/static/ \
-            --cache-control "max-age=31536000,immutable" --delete
+            s3://${BUCKET}/static/ --cache-control "max-age=31536000,immutable" --delete
           aws s3 sync /tmp/artifacts/frontend-prod/ \
-            s3://${{ secrets.S3_FRONTEND_BUCKET }}/ \
-            --cache-control "no-cache,no-store" --exclude "static/*" --delete
+            s3://${BUCKET}/ --cache-control "no-cache,no-store" \
+            --exclude "static/*" --delete
+          echo "✓ Frontend deployed to s3://${BUCKET}"
 
       - name: Invalidate CloudFront — PROD
         run: |
@@ -354,3 +434,11 @@ jobs:
             --query Parameter.Value --output text 2>/dev/null || echo "")
           [ -n "$DIST" ] && aws cloudfront create-invalidation \
             --distribution-id "$DIST" --paths "/*" || true
+
+      - name: Tag prod deployment in git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          TAG="prod-$(date +%Y%m%d-%H%M%S)"
+          git tag "${TAG}" && git push origin "${TAG}" || true
+          echo "✓ Tagged: ${TAG}"

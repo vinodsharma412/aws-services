@@ -1,15 +1,22 @@
-"""Application configuration — two-stage AWS edition.
+"""Application configuration — multi-account AWS edition.
 
-Two deployment stages:
-  ``staging`` — shared test environment, auto-deploys on every push.
-                Developers also use this stage locally.
-  ``prod``    — live users, requires manual approval before deploy.
+Two isolated AWS accounts:
+  ``aws-staging`` account — all staging resources, auto-deploy on every push
+  ``aws-prod`` account    — all prod resources, requires manual approval
 
-Each stage gets its own:
-  - DynamoDB table prefix  (``stg_`` for staging, none for prod)
-  - SQS queue              (``nse-scraping-jobs-staging`` / ``nse-scraping-jobs``)
-  - SSM parameter paths    (``/nse/staging/`` / ``/nse/prod/``)
-  - SNS alert topic        (``nse-alerts-staging`` / ``nse-alerts``)
+Account isolation replaces table prefixes:
+  - DynamoDB table prefix: NONE — accounts provide namespace isolation
+    staging account → table "users",  prod account → table "users" (different account)
+  - SQS queue:  nse-scraping-jobs  (same name, different account)
+  - SSM paths:  /nse/staging/ in staging account, /nse/prod/ in prod account
+  - Cognito:    separate User Pool per account
+  - S3 buckets: separate per account (bucket names include account-id)
+
+Benefits of multi-account:
+  - Zero blast radius — staging code CANNOT touch prod data (different account)
+  - Separate AWS bills per environment
+  - Separate IAM permissions per environment
+  - Prod can have stricter SCP (Service Control Policies) via AWS Organizations
 
 Secrets are loaded from SSM Parameter Store at startup (free tier, SecureString).
 For local development the same values can be placed in ``backend/.env`` and the
@@ -130,17 +137,16 @@ class Settings(BaseSettings):
 
     @property
     def table_prefix(self) -> str:
-        """DynamoDB table name prefix for the current stage.
+        """DynamoDB table name prefix.
 
-        Both stages run on the same EC2 and same AWS account, so prefixes
-        prevent staging code from ever touching production data.
+        Multi-account architecture: staging runs in the aws-staging account,
+        prod runs in the aws-prod account. AWS accounts provide full isolation —
+        no prefix is needed. Both environments use the same table names
+        (e.g. "users", "scraping_jobs") but in completely separate accounts.
 
-        Examples::
-
-            prod    → ""      → table name: "users"
-            staging → "stg_"  → table name: "stg_users"
+        Returns "" always. The AWS account itself is the namespace.
         """
-        return "" if self.STAGE == "prod" else "stg_"
+        return ""
 
     @property
     def is_production(self) -> bool:

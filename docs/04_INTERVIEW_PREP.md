@@ -1,137 +1,141 @@
-# Interview Prep — Serverless AWS Architecture
+# Interview Prep — Multi-Account AWS Architecture
 
-## 30-second project pitch
+## 30-second pitch
 
-"I built a full-stack NSE stock analysis platform using a fully serverless AWS architecture.
-The backend is FastAPI running inside Lambda via the Mangum ASGI adapter, with API Gateway as the entry point.
-All state is in DynamoDB and S3. A separate SQS-triggered Lambda handles Amazon product scraping.
-The frontend is React hosted on S3 + CloudFront. Everything deploys via GitHub Actions — no EC2, no VMs, zero infrastructure maintenance, all within the AWS free tier."
+"I built a full-stack NSE stock dashboard on AWS using a multi-account architecture —
+separate AWS accounts for staging and prod. The backend is pure Lambda functions
+(no FastAPI framework — API Gateway routes directly to Lambda). Authentication uses
+Cognito. Real-time scraping progress uses WebSocket API + DynamoDB Streams.
+Workflow orchestration uses Step Functions. Everything deploys via GitHub Actions
+with OIDC — no stored AWS credentials anywhere. 41 free-tier services, $0/month."
 
 ---
 
-## Key questions and answers
+## Key interview questions
 
-### "Why Lambda instead of EC2?"
+### "Why two AWS accounts instead of one?"
 
-Lambda is permanently free (1M req/month forever vs EC2 free only 12 months).
-There's nothing to maintain — no OS patches, no SSH, no Nginx config.
-Deploys take 30 seconds: `aws lambda update-function-code`.
-It auto-scales from 0 to 1,000 concurrent requests without configuration.
+Single-account approach uses table prefixes (`stg_users`, `prod_users`) but this
+has risks: a bug in staging code could accidentally write to `prod_users`.
+Two accounts provide **complete blast radius isolation** — staging can't touch
+prod at all, because they're different accounts. Also:
+- Separate AWS bills per environment
+- Separate IAM permissions (stricter in prod)
+- Separate CloudWatch logs (no mixing of logs)
+- Each account gets its own free tier (double the free resources)
+- AWS Organizations can add Service Control Policies to restrict prod further
 
-### "How does FastAPI run on Lambda?"
+### "How does GitHub Actions deploy to two different accounts?"
 
-One line of code using the Mangum library:
-```python
-handler = Mangum(app, lifespan="off")
-```
-Mangum is an ASGI adapter. API Gateway sends an HTTP event in JSON format.
-Mangum translates it into a standard ASGI request. FastAPI processes it normally.
-Mangum converts the response back to API Gateway's expected format.
-All existing FastAPI routes, auth, and DynamoDB code works unchanged.
+GitHub OIDC (OpenID Connect). No access keys stored anywhere.
+Each account has an IAM role `GitHubActionsRole-{stage}` with a trust policy
+that only allows GitHub's token service for this specific repo + branch.
 
-### "Why polling instead of SSE?"
+When the pipeline runs:
+1. GitHub generates a short-lived JWT signed by GitHub
+2. GitHub Actions uses `aws-actions/configure-aws-credentials` with `role-to-assume`
+3. AWS STS verifies the JWT against the OIDC provider
+4. Returns temporary 1-hour credentials
+5. Pipeline deploys using those credentials
 
-API Gateway + Lambda has a hard 29-second response timeout. SSE requires holding
-a connection open for minutes. Polling every 2 seconds:
-- Works within API Gateway's constraints
-- Costs < 1 DynamoDB read per poll (virtually free)
-- Users see updates within 2 seconds — functionally identical to SSE
+If GitHub is compromised, the attacker gets tokens that expire in 1 hour.
+If you need to revoke access, just delete the IAM role — no key rotation needed.
 
-### "How do you handle secrets?"
+### "How does Cognito replace your JWT auth?"
 
-SSM Parameter Store with SecureString type (encrypted at rest using KMS).
-Lambda reads secrets via boto3 at cold start with `@lru_cache(maxsize=1)`.
-No secrets in environment variables, no secrets in code.
-IAM role on Lambda has `ssm:GetParameter` permission for `/nse/{stage}/*` paths only.
+Before: `python-jose` generated JWTs, `bcrypt` hashed passwords, DynamoDB stored hashed passwords.
+After: Cognito handles all of this — user storage, password hashing, MFA, token issuance.
 
-### "How are staging and prod isolated?"
+Flow:
+1. User POSTs username/password to Lambda: `auth.handler`
+2. Lambda calls `cognito.initiate_auth(AuthFlow="USER_PASSWORD_AUTH")`
+3. Cognito returns `AccessToken`, `IdToken`, `RefreshToken`
+4. Frontend sends `IdToken` as `Authorization: Bearer` header
+5. API Gateway's **JWT Authorizer** validates `IdToken` against Cognito
+6. Lambda receives verified claims in `event.requestContext.authorizer.jwt.claims`
+7. No JWT decoding in Lambda — API Gateway already did it
 
-- DynamoDB: different table names (`stg_` prefix for staging)
-- SQS: different queue names (`nse-scraping-jobs-staging` vs `nse-scraping-jobs`)
-- Lambda: different function names
-- API Gateway: different APIs with different URLs
-- SSM: different parameter paths (`/nse/staging/` vs `/nse/prod/`)
+Security improvements: Cognito enforces password policy, handles brute force protection, supports MFA, manages token refresh.
 
-Same AWS account, same region, completely data-isolated.
+### "Walk me through the WebSocket real-time updates"
 
-### "Walk me through a deploy"
+Old: Frontend polls `GET /scraping/jobs` every 2 seconds (500ms wasted, DynamoDB read per poll)
+New: Browser connects once, server pushes instantly
 
-1. Developer pushes to `develop` branch
-2. GitHub Actions starts: ruff lint → npm build → pip install → zip
-3. `aws lambda update-function-code --zip-file lambda.zip` (30 seconds)
-4. Health check: `curl https://<staging-url>/api/v1/health/`
-5. `aws s3 sync build/ s3://bucket/staging/`
-6. Reviewer approves prod in GitHub UI
-7. Same steps for prod Lambda + CloudFront invalidation
+1. User submits scraping job → Lambda creates DynamoDB records + starts Step Functions
+2. Frontend opens WebSocket: `wss://<ws-api>.execute-api.ap-south-1.amazonaws.com/staging`
+3. Browser sends: `{"action": "subscribe", "job_id": "<uuid>"}`
+4. WebSocket Lambda stores: `{connection_id, user_id, job_id, ttl: now+2h}` in DynamoDB
+5. Step Functions runs Map state → 5 parallel Lambda invocations → each scrapes 1 ASIN
+6. Worker Lambda updates DynamoDB: `task.status = "completed"` (or `"failed"`)
+7. DynamoDB Stream record is generated (NEW_AND_OLD_IMAGES)
+8. `nse-dynamo-streams` Lambda is triggered
+9. Lambda queries `ws_connections` table: find all connections subscribed to this job
+10. For each connection: API Gateway Management API `post_to_connection`
+11. Browser receives: `{"type": "job_update", "pending": 3, "running": 2, ...}`
 
-No SSH. No servers. Code is running in 2 minutes.
+Zero polling. Zero wasted reads. Updates in milliseconds.
 
-### "What happens when a scraping job fails?"
+### "Why Step Functions for scraping?"
 
-1. SQS keeps the message visible after the Lambda function returns an error
-2. SQS retries after the visibility timeout (300 s)
-3. After 3 failed attempts: message moves to Dead Letter Queue (DLQ)
-4. DLQ has an event-source mapping to `nse-dlq-alert` Lambda
-5. dlq-alert Lambda reads task details from DynamoDB, formats an alert
-6. Publishes to SNS `nse-alerts-{stage}` topic → email to admin
+Step Functions Map state fans out to N parallel Lambda invocations automatically.
+For 10 ASINs with MaxConcurrency=5: runs 5 at a time, starts next as each finishes.
+Built-in retry with exponential backoff. Built-in error handling (Catch → RecordFailure).
+When all done: publishes SNS notification automatically.
 
-### "How do you monitor the application?"
+Alternative was N SQS messages → N Lambda invocations → manual DLQ → manual retry.
+Step Functions handles all of this with JSON config.
 
-CloudWatch automatically gets Lambda logs (no agent needed).
-6 alarms per stage: Lambda errors, DLQ depth > 0, API 5xx rate, DynamoDB throttles.
-Dashboard: Lambda invocations/errors/duration, SQS depth, API latency.
-`make logs STAGE=prod` — tails live logs from terminal.
+Free tier: 4,000 state transitions/month forever. A 10-ASIN job = ~30 transitions.
+
+### "How do you monitor the multi-account setup?"
+
+Each account has its own CloudWatch. To see everything:
+- `AWS_PROFILE=aws-staging make logs STAGE=staging` — staging Lambda logs
+- `AWS_PROFILE=aws-prod make logs STAGE=prod` — prod Lambda logs
+- X-Ray service maps in each account show end-to-end traces
+- Alarms in each account email to the same address via SNS
+- Resource Groups show all 41 services tagged `Project=NSEDashboard` per account
 
 ### "What's the cost?"
 
-Within the AWS free tier (12 months for some, forever for others):
-- Lambda: $0 forever (1M req/month free)
-- API Gateway: $0 for 12 months (1M req/month)
-- DynamoDB: $0 forever (25 GB storage, 25 RCU/WCU)
-- S3: $0 for 12 months (5 GB)
-- CloudFront: $0 for 12 months (1 TB transfer)
-- SQS: $0 forever (1M req/month)
-Total: $0/month for a production-grade serverless app.
+Staging account free tier + Prod account free tier = double the resources.
+With two accounts, both environments run completely free:
+- Lambda: 1M req × 2 accounts = 2M free requests
+- DynamoDB: 25 GB × 2 accounts = 50 GB free storage
+- API Gateway: 1M req × 2 accounts = 2M free requests
+
+Total: $0/month.
 
 ---
 
-## AWS services used and why
+## AWS services quick reference (for interviews)
 
-| Service | Role | Why not alternatives |
-|---|---|---|
-| API Gateway HTTP API | Entry point, rate limiting, CORS | REST API is cheaper; WebSocket not needed |
-| Lambda | All backend compute | vs EC2: no maintenance, always free |
-| Mangum | ASGI adapter for FastAPI | vs rewriting for Lambda: zero code change |
-| DynamoDB | Primary database | vs RDS: serverless, no patching, free tier |
-| S3 | Frontend hosting + avatar storage | vs server-side: scales automatically |
-| CloudFront | CDN + HTTPS | Free tier, caches S3, adds HTTPS |
-| SQS | Scraping job queue | Durable, retry, DLQ — better than in-memory |
-| SNS | Email alerts | vs SES: simpler, no domain verification |
-| SSM | Secret storage | vs Secrets Manager: SSM is free |
-| EventBridge | Scheduled jobs | vs cron on EC2: zero infrastructure |
-| CloudWatch | Logs + alarms + dashboards | Automatic for Lambda, free tier |
-| IAM | Access control | Roles not keys — no credential rotation |
-| Comprehend | AI sentiment analysis | 50K free units/month |
-
----
-
-## Architecture pattern: event-driven scraping
-
-```
-POST /scraping/jobs (Lambda API)
-  → DynamoDB: create job record + task records
-  → SQS: publish {task_id} for each ASIN
-
-SQS → Lambda worker (triggered per message)
-  → DynamoDB: task = "running"
-  → httpx: scrape amazon.in/dp/{asin}
-  → DynamoDB: task = "completed", product data saved
-  → SQS message deleted (success)
-
-Frontend polls GET /scraping/jobs every 2 s
-  → Lambda: DynamoDB query
-  → Returns updated job with task statuses
-  → React renders progress bar
-```
-
-This is the fan-out pattern: one API call fans out to N parallel Lambda invocations (one per ASIN). SQS handles backpressure naturally.
+| Service | 10-word explanation |
+|---|---|
+| API Gateway HTTP API | Managed HTTP router → Lambda/backend |
+| API Gateway WebSocket | Persistent bidirectional connection → Lambda |
+| Lambda | Run code without servers, pay per invocation |
+| Lambda Layers | Shared code/libraries across multiple Lambdas |
+| DynamoDB | NoSQL key-value store, serverless, auto-scaling |
+| DynamoDB Streams | CDC — triggers Lambda on every table change |
+| DynamoDB TTL | Auto-delete items after timestamp expires |
+| Cognito | Managed user pool — auth, MFA, token issuance |
+| S3 | Object storage — files, frontend, avatars |
+| CloudFront | Global CDN — cache S3/Lambda responses at edge |
+| SQS | Message queue — decouple producers from consumers |
+| SNS | Pub-sub — one message to many subscribers |
+| SES | Send transactional email from Lambda |
+| EventBridge | Event bus + cron scheduler for Lambda |
+| Step Functions | Visual workflow — orchestrate Lambda steps |
+| SSM Parameter Store | Store secrets, config — free alternative to Secrets Manager |
+| AppConfig | Feature flags — toggle features without redeploy |
+| X-Ray | Distributed tracing across all Lambda calls |
+| CloudWatch | Logs, metrics, alarms, dashboards |
+| CloudTrail | Audit log of every AWS API call |
+| Comprehend | ML sentiment analysis on text |
+| Translate | Machine translation (40+ languages) |
+| Rekognition | Computer vision — image moderation |
+| KMS | Encryption key management |
+| IAM | Identity and access management |
+| AWS Organizations | Multi-account management from master account |

@@ -1,182 +1,131 @@
 # Staging → Prod Promotion Workflow
 
----
-
-## The two-stage model
+## The two-account model
 
 ```
-develop branch  →  staging  →  (manual approval)  →  prod
+Developer laptop
+      │  git push develop
+      ▼
+GitHub Actions
+      │
+      ├──── Lint + Build (Lambda zips + frontend)
+      │
+      ├──── Deploy STAGING (aws-staging account) ─── AUTOMATIC
+      │     Assume GitHubActionsRole-staging via OIDC
+      │     Lambda update in aws-staging account
+      │     S3 sync in aws-staging account
+      │
+      └──── WAIT FOR APPROVAL ──────────────────────── MANUAL
+            ↓ (reviewer clicks Approve in GitHub)
+            Deploy PROD (aws-prod account)
+            Assume GitHubActionsRole-prod via OIDC
+            Lambda update in aws-prod account
+            S3 sync in aws-prod account
+            CloudFront invalidation in aws-prod account
+            Tag commit as prod-YYYYMMDD-HHMMSS
 ```
 
-Both stages are completely independent Lambda functions with separate:
-- DynamoDB tables (`stg_` prefix for staging, no prefix for prod)
-- SQS queues (`nse-scraping-jobs-staging` vs `nse-scraping-jobs`)
-- SNS topics (`nse-alerts-staging` vs `nse-alerts`)
-- SSM parameter paths (`/nse/staging/` vs `/nse/prod/`)
-- API Gateway endpoints (different URLs)
-- CloudFront distributions (separate)
+## Isolation between accounts
 
-**Staging is always one commit ahead of prod.** You test on staging before approving prod.
-
----
-
-## What triggers a deploy
-
-| Event | Staging | Prod |
+| Resource | aws-staging account | aws-prod account |
 |---|---|---|
-| Push to `develop` | Auto-deploys | No |
-| Push to `main` | No | No (use manual approve) |
-| Manual `workflow_dispatch` | Optional | Optional |
-| Reviewer approves in GitHub | No | Yes |
+| DynamoDB table "users" | staging users only | prod users only |
+| Lambda "nse-api-staging" | staging code | — |
+| Lambda "nse-api-prod" | — | prod code |
+| Cognito User Pool | staging logins | prod logins |
+| S3 frontend bucket | staging S3 bucket | prod S3 bucket |
+| SSM secrets | `/nse/staging/*` | `/nse/prod/*` |
+| CloudWatch logs | staging account logs | prod account logs |
+| AWS bill | staging costs | prod costs |
 
----
+**It is impossible** for staging code to accidentally write to prod DynamoDB —
+they are in completely separate AWS accounts.
 
-## The deploy pipeline (GitHub Actions)
-
-### Job 1: Lint & Test (runs first, blocks both deploys)
-
-```
-ruff check backend/app/ backend/lambda_handler.py
-npm ci && npm run build (STAGING config)
-npm run build (PROD config)
-pip install → zip → upload artifacts (api-lambda.zip, worker-lambda.zip)
-```
-
-Both Lambda packages are built once, reused for staging and prod.
-
-### Job 2: Deploy STAGING (auto, no approval)
-
-```
-aws lambda update-function-code --zip-file api-lambda.zip (nse-api-staging)
-aws lambda update-function-code --zip-file worker-lambda.zip (nse-scraping-worker-staging)
-Health check: curl https://<staging-url>/api/v1/health/
-aws s3 sync build/ s3://<bucket>/staging/
-aws cloudfront create-invalidation (staging dist)
-```
-
-### Job 3: Deploy PROD (waits for approval)
-
-GitHub shows a banner: **"Waiting for approval to deploy to prod"**
-
-To approve: GitHub → Actions → your workflow run → click **Review deployments** → **Approve and deploy**
-
-```
-aws lambda update-function-code --zip-file api-lambda.zip (nse-api-prod)
-aws lambda update-function-code --zip-file worker-lambda.zip (nse-scraping-worker-prod)
-Health check: curl https://<prod-url>/api/v1/health/
-aws s3 sync build/ s3://<bucket>/   (root, no prefix)
-aws cloudfront create-invalidation /* (prod dist)
-```
-
----
-
-## How to make a change and deploy
-
-### Normal feature development
+## How to deploy a change
 
 ```bash
-# 1. Make code changes locally
-# 2. Test on localhost:9000
+# 1. Make change locally, test on localhost:9000
+vim backend/handlers/stocks.py
 
-# 3. Commit and push
-git add backend/app/api/v1/endpoints/stocks.py
-git commit -m "feat: add P/E ratio filter to screener"
+# 2. Commit and push
+git add backend/handlers/stocks.py
+git commit -m "feat: add volume-weighted average price to stock analysis"
 git push origin develop
 
-# 4. Wait ~2 minutes → staging deployed automatically
-# 5. Test on staging API URL
-#    curl https://<staging-url>/api/v1/stocks/screener?min_yield=0.03
+# 3. GitHub Actions starts automatically:
+#    Lint → Build Lambda zips → Deploy STAGING (2 min)
 
-# 6. Open GitHub → Actions → approve prod deployment
-# 7. Wait ~1 minute → prod deployed
+# 4. Test on staging
+curl -H "Authorization: Bearer <token>" \
+  https://<STAGING_API_URL>/api/v1/stocks/basic/RELIANCE.NS
+
+# 5. Approve prod in GitHub UI:
+#    Actions → your run → "Deploy → aws-prod" → Review deployments → Approve
+
+# 6. Prod deploys in ~2 min
+# 7. Commit is tagged: prod-20260601-143022
 ```
 
-### Hotfix to prod
+## What GitHub Environments enforce
 
-If you find an urgent bug in prod:
-```bash
-git checkout develop
-# fix the bug
-git commit -m "fix: correct portfolio P&L calculation"
-git push origin develop
-# → staging auto-deploys, test quickly
-# → approve prod immediately
-```
+**staging** environment: no rules → deploys immediately after build
 
-There is no separate prod branch — all deploys go through develop → staging → prod.
+**prod** environment:
+- Required reviewer must click Approve
+- The reviewer sees exactly which commit is being deployed
+- If they click Reject, the prod job is cancelled
+- The code already on prod remains unchanged
 
----
-
-## Checking what's deployed
+## How to rollback prod
 
 ```bash
-# Which zip is currently running in staging?
-aws lambda get-function-configuration \
-  --function-name nse-api-staging \
-  --query "[CodeSize,LastModified,Environment.Variables.STAGE]" \
-  --region ap-south-1
+# Option 1: Re-run a previous GitHub Actions workflow
+# GitHub → Actions → find the last good run → Re-run jobs → "Deploy → aws-prod"
 
-# Check the Lambda code hash (matches the artifact hash from GitHub Actions)
-aws lambda get-function \
+# Option 2: Deploy a previous commit directly
+git checkout <previous-commit-hash>
+git push origin develop --force  # triggers new pipeline
+
+# Option 3: Update Lambda directly (fastest, no CI)
+AWS_PROFILE=aws-prod aws lambda update-function-code \
   --function-name nse-api-prod \
-  --query "Configuration.CodeSha256" \
+  --zip-file fileb://api-lambda-backup.zip \
   --region ap-south-1
 ```
 
----
-
-## Rolling back prod
-
-Lambda keeps the last deployed code. To rollback:
+## How to watch what's deployed
 
 ```bash
-# Option 1: Redeploy the previous artifact
-# In GitHub Actions → find the last working run → re-run that deploy-prod job
-
-# Option 2: Use Lambda aliases + versions (advanced)
-# Publish a version:
-aws lambda publish-version --function-name nse-api-prod --region ap-south-1
-
-# Point the alias to the previous version:
-aws lambda update-alias \
+# Which version is in prod right now?
+AWS_PROFILE=aws-prod aws lambda get-function-configuration \
   --function-name nse-api-prod \
-  --name live \
-  --function-version <previous-version-number> \
+  --query "[LastModified, CodeSize]" \
   --region ap-south-1
+
+# All prod deployment tags
+git tag | grep prod- | sort
+
+# Live prod logs
+make logs STAGE=prod
+
+# Health check both
+make health
 ```
 
-For simplicity, re-running the last good GitHub Actions job is the fastest rollback.
+## Multi-account billing
 
----
+Each AWS account has its own bill:
+- `aws-staging` free tier: resets on staging account creation date
+- `aws-prod` free tier: resets on prod account creation date
 
-## Environment isolation checklist
+They don't share free tier limits — you effectively get **double the free tier**.
 
-Before deploying to prod, verify on staging:
+## Branch strategy
 
-- [ ] Login works (JWT token issued)
-- [ ] Stock analysis returns data (`/api/v1/stocks/basic/RELIANCE.NS`)
-- [ ] Scraping job creates and workers pick up tasks
-- [ ] Portfolio operations work (add/view/delete transaction)
-- [ ] CloudWatch logs show no errors
-
-```bash
-# Quick smoke test on staging
-STAGING_URL="https://<staging-url>/api/v1"
-TOKEN=$(curl -s -X POST "$STAGING_URL/auth/token" \
-  -d "username=admin&password=<password>" | jq -r .access_token)
-
-curl -s -H "Authorization: Bearer $TOKEN" "$STAGING_URL/health/"
-curl -s -H "Authorization: Bearer $TOKEN" "$STAGING_URL/stocks/basic/RELIANCE.NS" | jq .current_price
+```
+develop  ─────────────────────────────────────► (deployed to staging)
+              │
+              └── approved ──────────────────► (deployed to prod + tagged)
 ```
 
----
-
-## Cost isolation
-
-Staging and prod share the same AWS account but are completely data-isolated.
-Neither stage can accidentally write to the other's DynamoDB tables (different names).
-
-Both stages are within the AWS free tier individually:
-- Lambda: each stage uses a fraction of 1M free requests/month
-- DynamoDB: both stages together use << 25 GB storage
-- API Gateway: both stages together use << 1M requests/month
+No separate `main` branch needed. The GitHub Environment approval is the gate.

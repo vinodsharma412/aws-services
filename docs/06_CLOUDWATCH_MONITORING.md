@@ -1,191 +1,160 @@
-# CloudWatch Monitoring Guide
+# CloudWatch Monitoring — Multi-Account
 
-Everything you need to observe what your serverless application is doing in real time.
+## Important: logs are per-account
 
----
-
-## Log Groups
-
-Lambda automatically creates CloudWatch Log Groups. No setup needed.
-
-| Log Group | What it contains |
-|---|---|
-| `/aws/lambda/nse-api-staging` | Every API request: method, path, status, duration |
-| `/aws/lambda/nse-api-prod` | Same for prod |
-| `/aws/lambda/nse-scraping-worker-staging` | Each scraping task: asin, success/fail, error |
-| `/aws/lambda/nse-scraping-worker-prod` | Same for prod |
-| `/aws/lambda/nse-screener-refresh-staging` | Scheduled screener job runs |
-| `/aws/lambda/nse-dlq-alert-staging` | DLQ alerts sent to SNS |
-| `/aws/apigateway/nse-api-staging` | API Gateway access logs (IP, latency, status) |
-
----
-
-## View logs from terminal
+Each AWS account has its own CloudWatch. Always specify the correct AWS profile:
 
 ```bash
-# Tail live API logs (staging)
-make logs STAGE=staging
-# or directly:
+# Staging account logs
+export AWS_PROFILE=aws-staging && make logs STAGE=staging
+
+# Prod account logs
+export AWS_PROFILE=aws-prod && make logs STAGE=prod
+```
+
+## Log Groups (per account)
+
+| Log Group | What it shows |
+|---|---|
+| `/aws/lambda/nse-api-staging` | Every API request (auth, users, stocks, scraping) |
+| `/aws/lambda/nse-scraping-worker-staging` | Each ASIN scrape: success/fail/error |
+| `/aws/lambda/nse-ws-staging` | WebSocket connect/disconnect/subscribe |
+| `/aws/lambda/nse-dynamo-streams-staging` | WebSocket push events |
+| `/aws/lambda/nse-ses-notifications-staging` | Email sends |
+| `/aws/lambda/nse-dlq-alert-staging` | Permanently failed scraping tasks |
+| `/aws/apigateway/nse-api-staging` | API GW access log: IP, latency, status |
+| `/aws/states/nse-scraping-staging` | Step Functions execution logs |
+
+## Live log commands
+
+```bash
+# Tail any log group live
 aws logs tail /aws/lambda/nse-api-staging --follow --region ap-south-1
 
-# Tail live worker logs
-make logs-worker STAGE=staging
-
-# Last 30 minutes of errors only
+# Filter for errors only
 aws logs filter-log-events \
   --log-group-name /aws/lambda/nse-api-staging \
   --filter-pattern "ERROR" \
-  --start-time $(($(date +%s) - 1800))000 \
   --region ap-south-1
 
-# Find all failed scraping tasks
+# Filter for a specific user
 aws logs filter-log-events \
-  --log-group-name /aws/lambda/nse-scraping-worker-staging \
-  --filter-pattern "FAIL" \
+  --log-group-name /aws/lambda/nse-api-staging \
+  --filter-pattern "user_id=abc-123" \
+  --region ap-south-1
+
+# Step Functions execution errors
+aws logs filter-log-events \
+  --log-group-name /aws/states/nse-scraping-staging \
+  --filter-pattern "ExecutionFailed" \
   --region ap-south-1
 ```
 
----
+## Alarms (6 per account)
 
-## CloudWatch Insights queries
+Run `make setup-cloudwatch` to create these in each account:
 
-Go to **CloudWatch → Logs Insights** and run these queries.
+| Alarm | Threshold | Meaning |
+|---|---|---|
+| `nse-lambda-api-errors` | errors > 0 in 5 min | Lambda handler crashed |
+| `nse-lambda-worker-errors` | errors > 0 in 5 min | Scraping Lambda crashed |
+| `nse-sqs-dlq-depth` | messages > 0 | ASIN failed 3 times permanently |
+| `nse-apigw-5xx` | 5xx > 10 in 5 min | API returning server errors |
+| `nse-lambda-screener-errors` | errors > 0 | Screener cache broken |
+| `nse-lambda-universe-errors` | errors > 0 | NSE symbol list not updated |
 
-### API error rate (last 1 hour)
+All alarms → SNS → email to your address.
+
+## Dashboard: NSE-Operations-staging / NSE-Operations-prod
+
+AWS Console → CloudWatch → Dashboards → NSE-Operations-staging
+
+**Panels:**
+1. Lambda Invocations & Errors (API + Worker + Screener + Universe)
+2. SQS Queue Depth (main queue + DLQ)
+3. API Gateway Requests & Errors (4xx, 5xx)
+4. Lambda Duration p50/p99
+5. DynamoDB Consumed RCU/WCU
+6. Step Functions Executions (success vs fail)
+7. WebSocket Connections (active count)
+8. X-Ray: slowest traces
+
+## X-Ray service map
+
+AWS Console → CloudWatch → X-Ray Traces → Service Map
+
+Shows:
+- Every Lambda function as a node
+- Lines connecting Lambda → DynamoDB, Lambda → SQS, etc.
+- Color coding: green (OK), red (errors), yellow (slow)
+- Click any node → see individual traces
+- Click any trace → see exactly which DynamoDB call took 200ms
+
+Useful for:
+- Finding slow endpoints
+- Tracking down which external API call is failing
+- Understanding request flow
+
+## CloudWatch Insights — useful queries
+
+Open: Console → CloudWatch → Logs Insights → select log group → run query
+
+**API error rate by route (last 1 hour):**
 ```
 SOURCE '/aws/lambda/nse-api-staging'
 | filter @message like /ERROR/
-| stats count() as error_count by bin(5m)
-| sort bin(5m) asc
+| parse @message "* handler error: *" as handler, error
+| stats count() as errors by handler
+| sort errors desc
 ```
 
-### Slowest API routes (p99 latency)
+**Slowest Lambda invocations:**
 ```
-SOURCE '/aws/apigateway/nse-api-staging'
-| fields routeKey, status, responseLength
-| stats count() as calls, avg(responseLength) as avg_bytes by routeKey
-| sort calls desc
+SOURCE '/aws/lambda/nse-api-staging'
+| filter @type = "REPORT"
+| fields @requestId, @duration, @billedDuration, @memorySize, @maxMemoryUsed
+| sort @duration desc
 | limit 20
 ```
 
-### Scraping success rate
+**Scraping success rate:**
 ```
 SOURCE '/aws/lambda/nse-scraping-worker-staging'
 | filter @message like /DONE|FAIL/
-| stats count(@message) as total,
-        sum(@message like /DONE/) as success,
-        sum(@message like /FAIL/) as failed
+| stats
+    count(@message) as total,
+    sum((@message like /DONE/) == 1) as success,
+    sum((@message like /FAIL/) == 1) as failed
 ```
 
-### Lambda cold starts
+**WebSocket connection activity:**
 ```
-SOURCE '/aws/lambda/nse-api-staging'
-| filter @message like /Init Duration/
-| stats count() as cold_starts, avg(@duration) as avg_init_ms
+SOURCE '/aws/lambda/nse-ws-staging'
+| filter @message like /connect|disconnect|subscribe/
+| stats count() as events by bin(5m)
+| sort bin(5m) asc
 ```
-
----
-
-## Alarms
-
-Run `bash infrastructure/cloudwatch/setup_alarms.sh staging <api-gw-id>` to create:
-
-| Alarm | Condition | Action |
-|---|---|---|
-| `nse-lambda-api-errors-staging` | Lambda errors > 0 in 5 min | SNS email |
-| `nse-lambda-worker-errors-staging` | Worker errors > 0 in 5 min | SNS email |
-| `nse-sqs-dlq-depth-staging` | DLQ visible messages > 0 | SNS email |
-| `nse-apigw-5xx-staging` | API 5xx > 10 in 5 min | SNS email |
-| `nse-lambda-screener-errors-staging` | Screener Lambda errors > 0 | SNS email |
-| `nse-lambda-universe-errors-staging` | Universe Lambda errors > 0 | SNS email |
-
-View in console: **CloudWatch → Alarms → filter: `nse-*-staging`**
-
----
-
-## Dashboard
-
-Each stage has a pre-built dashboard at:
-**CloudWatch → Dashboards → NSE-Operations-staging**
-
-Panels:
-1. **Lambda Invocations & Errors** — API + Worker + Screener calls per 5 min
-2. **SQS Queue Depth** — main queue + DLQ (DLQ should always be 0)
-3. **API Gateway Requests & Errors** — total req, 4xx, 5xx per 5 min
-4. **Lambda Duration** — p50 and p99 response time
-5. **DynamoDB RCU/WCU** — consumed read/write capacity
-
----
-
-## Lambda metrics explained
-
-| Metric | Healthy value | Warning |
-|---|---|---|
-| `Invocations` | Any | N/A |
-| `Errors` | 0 | > 0 = something broken |
-| `Throttles` | 0 | > 0 = hit concurrency limit |
-| `Duration p99` | < 5000 ms | > 25000 ms = close to timeout |
-| `ConcurrentExecutions` | < 100 | > 500 = check quota |
-
-Free tier gives 400,000 GB-seconds/month. With 512 MB Lambda and average 2-second responses:
-- 400,000 / (0.5 GB × 2 s) = 400,000 free invocations/month
-
----
 
 ## What to do when an alarm fires
 
-### DLQ depth > 0 (scraping job permanently failed)
+**Lambda errors alarm:**
 ```bash
-# See what's in the DLQ
-aws sqs receive-message \
-  --queue-url <dlq-url> \
-  --region ap-south-1
-
-# Look at the task in DynamoDB
-aws dynamodb get-item \
-  --table-name stg_scraping_tasks \
-  --key '{"task_id": {"S": "<task-id>"}}' \
-  --region ap-south-1
-```
-Common causes: Amazon CAPTCHA, ASIN removed from site, network timeout.
-
-### API Lambda errors
-```bash
-# Get recent error logs
+# Get last 20 errors with context
 aws logs filter-log-events \
   --log-group-name /aws/lambda/nse-api-staging \
   --filter-pattern "ERROR" \
   --region ap-south-1 \
-  --limit 20
+  --limit 20 | jq '.events[].message'
 ```
 
-### API Gateway 5xx spike
-Check if the Lambda function has errors (see above). Also check DynamoDB throttles:
+**SQS DLQ alarm (scraping permanently failed):**
 ```bash
-aws cloudwatch get-metric-statistics \
-  --namespace AWS/DynamoDB \
-  --metric-name SystemErrors \
-  --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
-  --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
-  --period 300 \
-  --statistics Sum \
-  --region ap-south-1
+# See what's in the DLQ
+DLQ_URL=$(aws sqs get-queue-url --queue-name nse-scraping-jobs-staging-dlq \
+  --query QueueUrl --output text --region ap-south-1)
+aws sqs receive-message --queue-url $DLQ_URL --region ap-south-1
+
+# Check the task in DynamoDB
+aws dynamodb get-item --table-name scraping_tasks \
+  --key '{"task_id":{"S":"<task-id>"}}' --region ap-south-1
 ```
-
----
-
-## X-Ray tracing (optional)
-
-Add distributed tracing to see exactly which DynamoDB call is slow:
-
-```bash
-# Enable X-Ray on Lambda
-aws lambda update-function-configuration \
-  --function-name nse-api-staging \
-  --tracing-config Mode=Active \
-  --region ap-south-1
-```
-
-Then: **CloudWatch → X-Ray Traces** — see end-to-end request maps including DynamoDB latency.
-
-Free tier: 100,000 traces/month forever.

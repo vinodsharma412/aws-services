@@ -1,209 +1,169 @@
-# Developer Guide — Serverless NSE Stock Dashboard
+# Developer Guide — Daily Workflow
 
 ## Local development
 
 ```bash
-# Backend (FastAPI)
-cd backend
-pip install -r requirements.txt
-STAGE=staging uvicorn app.main:app --reload --port 9000
-# → http://localhost:9000/docs  (Swagger UI)
+# Install dependencies
+pip install -r backend/requirements.txt
+cd frontend && npm install
 
-# Frontend (React)
-cd frontend
-npm install && npm start
+# Start backend (uses staging DynamoDB tables via AWS profile)
+export AWS_PROFILE=aws-staging
+cd backend && STAGE=staging uvicorn app.main:app --reload --port 9000
+# → http://localhost:9000/docs
+
+# Start frontend
+cd frontend && npm start
 # → http://localhost:3000
-
-# Env file for local dev
-cp backend/.env.example backend/.env
-# Set STAGE=staging (reads DynamoDB staging tables via your AWS profile)
 ```
 
-Local development uses your `~/.aws/credentials` to access AWS (DynamoDB, S3, SQS).
-No Lambda needed locally — FastAPI runs directly via uvicorn.
+Local dev uses your `~/.aws` profile to access the **staging** account DynamoDB tables.
+Never run local dev against prod account credentials.
 
----
-
-## How Lambda + Mangum works
-
-The key file is `backend/lambda_handler.py`:
-
-```python
-from mangum import Mangum
-from app.main import app
-
-handler = Mangum(app, lifespan="off")
-```
-
-When API Gateway receives a request, it calls `lambda_handler.handler(event, context)`.
-Mangum translates the API Gateway HTTP event into a standard ASGI request.
-FastAPI processes it exactly as if uvicorn sent it.
-Mangum then converts the ASGI response back into the API Gateway format.
-
-Your FastAPI code is completely unchanged — just add `lambda_handler.py`.
-
----
-
-## Project layout
-
-```
-backend/
-├── app/
-│   ├── main.py                  FastAPI app factory (CORS, middleware, router)
-│   ├── config.py                Settings + SSM secret loading (lru_cache)
-│   ├── dependencies.py          JWT decode → DynamoDB user lookup
-│   ├── api/v1/
-│   │   ├── router.py            Assembles all sub-routers
-│   │   └── endpoints/
-│   │       ├── auth.py          POST /auth/token → JWT
-│   │       ├── users.py         CRUD + S3 avatar upload
-│   │       ├── stocks.py        yfinance analysis, portfolio, watchlist
-│   │       ├── scraping.py      Amazon scraping jobs (polling, no SSE)
-│   │       ├── menu.py          Navigation menu CRUD
-│   │       └── health.py        GET /health/ → {"status":"ok"}
-│   ├── crud/
-│   │   ├── user_dynamo.py       DynamoDB users table operations
-│   │   ├── stock_dynamo.py      Transactions + watchlist operations
-│   │   └── scraping_dynamo.py   Scraping jobs + tasks operations
-│   ├── services/
-│   │   ├── auth_service.py      Login validation → JWT creation
-│   │   ├── stock_service.py     yfinance fetch + analysis
-│   │   ├── sentiment_service.py Bing news → Comprehend → score
-│   │   ├── scraping_queue.py    SQS enqueue/receive/delete
-│   │   └── s3_storage.py        Avatar upload/delete
-│   ├── schemas/                 Pydantic models (request/response)
-│   └── core/
-│       ├── security.py          bcrypt + JWT encode/decode
-│       └── roles.py             ADMIN/MANAGER/VIEWER role guards
-├── lambda_handler.py            Mangum entry point for Lambda
-└── requirements.txt
-```
-
----
-
-## Adding a new API endpoint
-
-1. Add route in the appropriate `endpoints/` file:
-```python
-@router.get("/new-route")
-def my_new_endpoint(current_user: dict = Depends(get_current_active_user)):
-    return {"hello": current_user["username"]}
-```
-
-2. If it needs DynamoDB, add a function in `crud/`:
-```python
-def get_my_data(user_id: str) -> list:
-    resp = dynamo_table.query(...)
-    return resp.get("Items", [])
-```
-
-3. Push to develop → staging auto-deploys (~2 min) → approve prod.
-
-No restart needed. Lambda loads your new code on the next invocation.
-
----
-
-## Debugging
-
-### Check what Lambda is executing
+## Make a code change
 
 ```bash
-# Last 100 log lines from staging API
-aws logs tail /aws/lambda/nse-api-staging --region ap-south-1
+# Edit a Lambda handler
+vim backend/handlers/stocks.py
 
-# Live logs while making API calls
+# Lint
+make lint
+
+# Test locally at localhost:9000
+
+# Push to staging
+git add backend/handlers/stocks.py
+git commit -m "feat: add RSI divergence signal"
+git push origin develop
+
+# → GitHub Actions: lint → build → deploy to aws-staging (~3 min)
+# → Test on staging: curl https://<STAGING_API_URL>/api/v1/stocks/basic/RELIANCE.NS
+# → Approve in GitHub to deploy to aws-prod
+```
+
+## Lambda handler pattern
+
+Each handler file handles all routes for one domain. No framework — pure Python:
+
+```python
+# backend/handlers/my_feature.py
+from aws_xray_sdk.core import patch_all, xray_recorder
+from handlers._base import ok, bad_request, get_method, get_path, get_body
+
+patch_all()  # auto-trace all boto3 calls
+
+@xray_recorder.capture("my_feature")
+def handler(event, context):
+    method = get_method(event)
+    path = get_path(event)
+    body = get_body(event)
+
+    if method == "GET" and path.endswith("/my-route"):
+        return ok({"result": "data"})
+
+    if method == "POST":
+        data = body.get("field")
+        # ... do work
+        return ok({"created": True}, 201)
+
+    return ok({"detail": "Route not found"}, 404)
+```
+
+Register the handler in `infrastructure/scripts/api_gateway_setup.sh` as a new route.
+
+## Environment variables in Lambda
+
+Set via Lambda console or update the deploy script. Read in Python:
+
+```python
+import os
+STAGE = os.environ.get("STAGE", "staging")
+```
+
+Secrets are always in SSM, never in env vars:
+
+```python
+import boto3
+ssm = boto3.client("ssm")
+secret = ssm.get_parameter(Name=f"/nse/{STAGE}/my-secret", WithDecryption=True)["Parameter"]["Value"]
+```
+
+## Use AppConfig feature flags
+
+```python
+from utils.appconfig import get_flag, is_enabled
+
+if is_enabled("COMPREHEND_ENABLED"):
+    score = comprehend_sentiment(text)
+else:
+    score = keyword_sentiment(text)
+```
+
+Change flag in AWS Console → AppConfig → NSEDashboard → FeatureFlags.
+Takes effect within 30 seconds. No redeployment.
+
+## View logs
+
+```bash
+# Live staging API logs
 make logs STAGE=staging
-# (in another terminal) curl https://<staging-url>/api/v1/health/
+export AWS_PROFILE=aws-staging && make logs STAGE=staging
+
+# Live prod logs
+export AWS_PROFILE=aws-prod && make logs STAGE=prod
+
+# Search for errors (last 1 hour)
+AWS_PROFILE=aws-staging aws logs filter-log-events \
+  --log-group-name /aws/lambda/nse-api-staging \
+  --filter-pattern "ERROR" \
+  --start-time $(($(date +%s) - 3600))000 \
+  --region ap-south-1
+
+# X-Ray traces (open in browser)
+make xray
 ```
 
-### Test an endpoint directly
+## Health check
 
 ```bash
-# Get a token
-TOKEN=$(curl -s -X POST https://<api-url>/api/v1/auth/token \
-  -d "username=admin&password=<pass>" | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
-
-# Call an endpoint
-curl -H "Authorization: Bearer $TOKEN" https://<api-url>/api/v1/users/me
+make health
+# → Staging health: {"status":"ok","stage":"staging"} ✓
+# → Prod health: {"status":"ok","stage":"prod"} ✓
 ```
 
-### Check DynamoDB for a user
+## Debugging a Lambda function
 
 ```bash
-aws dynamodb scan \
-  --table-name stg_users \
-  --filter-expression "username = :u" \
+# View last 100 lines
+AWS_PROFILE=aws-staging aws logs tail \
+  /aws/lambda/nse-api-staging \
+  --region ap-south-1
+
+# Test invoke directly (bypasses API Gateway)
+AWS_PROFILE=aws-staging aws lambda invoke \
+  --function-name nse-api-staging \
+  --payload '{"rawPath":"/api/v1/health","requestContext":{"http":{"method":"GET"}}}' \
+  --region ap-south-1 \
+  /tmp/response.json && cat /tmp/response.json
+```
+
+## DynamoDB quick inspection
+
+```bash
+# List tables in staging account
+AWS_PROFILE=aws-staging aws dynamodb list-tables --region ap-south-1
+
+# Find a user
+AWS_PROFILE=aws-staging aws dynamodb query \
+  --table-name users \
+  --index-name username-index \
+  --key-condition-expression "username = :u" \
   --expression-attribute-values '{":u":{"S":"admin"}}' \
   --region ap-south-1
-```
 
-### Check SQS queue depth
-
-```bash
-aws sqs get-queue-attributes \
-  --queue-url <queue-url> \
-  --attribute-names ApproximateNumberOfMessages \
+# Count items in a table
+AWS_PROFILE=aws-staging aws dynamodb scan \
+  --table-name scraping_jobs \
+  --select COUNT \
   --region ap-south-1
 ```
-
----
-
-## Common issues
-
-### Lambda timeout (30 s)
-
-Stock analysis (`/stocks/analyse/{symbol}`) calls yfinance and news APIs which can take 10-20 s.
-If it hits 30 s, increase Lambda timeout:
-```bash
-aws lambda update-function-configuration \
-  --function-name nse-api-staging \
-  --timeout 60 \
-  --region ap-south-1
-```
-
-### Cold start latency
-
-First Lambda call after idle takes 3-5 s (cold start).
-Subsequent calls within ~5 minutes reuse the same container (warm).
-
-To reduce cold starts:
-- Keep package size small (remove unused deps)
-- Use Lambda Provisioned Concurrency (not free tier)
-
-### Package too large (>250 MB)
-
-Check what's large:
-```bash
-du -sh build_staging/* | sort -rh | head -20
-```
-
-Solutions:
-- Use AWS-managed layers (pandas, numpy already handled)
-- Remove unused packages from requirements.txt
-- Use `--exclude` flags in pip install
-
-### DynamoDB table not found
-
-Make sure you ran `make dynamo-tables STAGE=staging` before deploying.
-Check with:
-```bash
-aws dynamodb list-tables --region ap-south-1 | grep nse
-```
-
----
-
-## Environment variables reference
-
-Set on Lambda (in deploy scripts or CI/CD):
-
-| Variable | Description | Where set |
-|---|---|---|
-| `STAGE` | `staging` or `prod` | CI/CD env var |
-| `AWS_REGION` | `ap-south-1` | CI/CD env var |
-| `SECRET_KEY` | JWT signing key | SSM `/nse/{stage}/jwt-secret` |
-| `S3_ASSETS_BUCKET` | Avatar bucket name | SSM `/nse/{stage}/s3-assets-bucket` |
-| `SQS_SCRAPING_JOBS_URL` | SQS queue URL | SSM `/nse/{stage}/sqs-jobs-url` |
-| `SNS_ALERTS_ARN` | SNS topic ARN | SSM `/nse/{stage}/sns-alerts-arn` |
-| `COMPREHEND_ENABLED` | `true`/`false` | Lambda env var |
-
-All empty vars are auto-loaded from SSM at Lambda cold start via `config.py:get_settings()`.

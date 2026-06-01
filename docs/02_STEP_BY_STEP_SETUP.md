@@ -1,169 +1,252 @@
-# Step-by-Step AWS Setup — Zero to Deployed (Serverless)
+# Step-by-Step Setup — Two AWS Accounts (Staging + Prod)
 
-This guide takes you from a blank AWS account to a fully deployed serverless application.
-No EC2. No SSH. No servers to manage. Time: ~60 minutes first time, ~10 min for each redeploy.
-
----
-
-## Prerequisites
-
-- AWS account (free tier)
-- AWS CLI installed: `pip install awscli` and `aws configure`
-- Python 3.12+ and Node 20+
-- GitHub account (for CI/CD)
+> **Read this first. Do every step in order. Don't skip.**
 
 ---
 
-## Step 1 — IAM: Create Lambda execution role
+## Before you start — what you need
 
-```bash
-bash infrastructure/iam/setup_lambda_role.sh
-```
-
-Creates `NSELambdaRole` with permissions for DynamoDB, S3, SQS, SNS, SSM, CloudWatch, Comprehend.
-All Lambda functions run under this role — no hard-coded AWS keys anywhere.
-
----
-
-## Step 2 — S3: Create buckets
-
-```bash
-bash infrastructure/scripts/s3_setup.sh
-```
-
-- `nse-frontend-{account-id}` — React build (static website hosting)
-- `nse-assets-{account-id}` — User avatars (private)
+- [ ] **Two AWS accounts** (free, see Step 0)
+- [ ] **AWS CLI installed** on your machine
+- [ ] **GitHub account** with the `aws-services` repo
+- [ ] **Your email address** (for alerts)
+- [ ] **~60 minutes** total
 
 ---
 
-## Step 3 — DynamoDB: Create tables
+## Step 0 — Create two AWS accounts
 
-```bash
-make dynamo-tables STAGE=staging    # creates stg_users, stg_scraping_tasks, etc.
-make dynamo-tables STAGE=prod       # creates users, scraping_tasks, etc.
-```
+You need **two separate AWS accounts**:
+- `aws-staging` — developers test here (auto-deploys on every push)
+- `aws-prod` — real users here (manual approval required)
 
-12 tables per stage, PAY_PER_REQUEST billing (free within free tier).
+### 0a. Create accounts via AWS Organizations (recommended)
 
----
+AWS Organizations lets you manage both accounts from a single "master" account.
+The benefit: one login, one billing, separate IAM per account.
 
-## Step 4 — SSM: Store secrets
+1. Go to [aws.amazon.com](https://aws.amazon.com) → **Create a Free Account**
+2. This becomes your **master/management account**
+3. In the AWS Console → **AWS Organizations** → **Add an AWS account**
+4. Create `aws-staging` account (give it a unique email, e.g. `yourname+staging@gmail.com`)
+5. Create `aws-prod` account (unique email, e.g. `yourname+prod@gmail.com`)
 
-```bash
-bash infrastructure/ssm/setup_ssm.sh staging
-bash infrastructure/ssm/setup_ssm.sh prod
-```
+Each account gets its own 12-month free tier from creation date.
 
-Enter when prompted:
-- JWT secret (generate: `openssl rand -hex 32`)
-- Gmail address + app password (for alert emails)
+### 0b. Alternative: Two completely independent accounts
 
-Stored as SecureString — encrypted, never in code.
-
----
-
-## Step 5 — SQS + SNS
-
-```bash
-bash infrastructure/sqs/setup_sqs.sh staging
-bash infrastructure/sqs/setup_sqs.sh prod
-
-bash infrastructure/sns/setup_sns.sh staging your@email.com
-bash infrastructure/sns/setup_sns.sh prod   your@email.com
-```
-
-Check your email and click Confirm subscription for SNS.
+Just create two separate AWS accounts at [aws.amazon.com](https://aws.amazon.com).
+Use different email addresses. No Organizations needed.
 
 ---
 
-## Step 6 — Deploy Lambda functions
-
-### API Lambda
+## Step 1 — Install and configure AWS CLI
 
 ```bash
-bash infrastructure/lambda/api/deploy.sh staging
-bash infrastructure/lambda/api/deploy.sh prod
+# Install AWS CLI
+pip install awscli
+
+# Configure profiles (one per account)
+aws configure --profile aws-staging
+# Enter: Access Key ID, Secret Access Key, region (ap-south-1), output (json)
+
+aws configure --profile aws-prod
+# Enter: Access Key ID, Secret Access Key, region (ap-south-1), output (json)
+
+# Test
+aws sts get-caller-identity --profile aws-staging
+aws sts get-caller-identity --profile aws-prod
 ```
 
-Packages FastAPI + Mangum into a zip, uploads to Lambda.
-Attaches the AWS-managed pandas layer (pandas/numpy pre-built for Lambda).
-
-### Scraping Worker Lambda
-
-```bash
-bash infrastructure/lambda/scraping_worker/deploy.sh staging
-bash infrastructure/lambda/scraping_worker/deploy.sh prod
-```
-
-Also wires SQS as the event source trigger (batch size = 1).
+**How to get access keys per account:**
+1. Log into each AWS account console
+2. IAM → Users → Create user → Attach `AdministratorAccess`
+3. Security credentials → Create access key → Download CSV
 
 ---
 
-## Step 7 — API Gateway
+## Step 2 — Clone the repository
 
 ```bash
-bash infrastructure/scripts/api_gateway_setup.sh staging
-bash infrastructure/scripts/api_gateway_setup.sh prod
-```
-
-Creates HTTP API → Lambda integration for each stage.
-Outputs the invoke URL — copy it for GitHub Secrets.
-
-Test:
-```bash
-curl https://<api-id>.execute-api.ap-south-1.amazonaws.com/api/v1/health/
-# {"status":"ok","stage":"staging"}
+git clone https://github.com/vinodsharma412/aws-services.git
+cd aws-services
+git checkout develop
 ```
 
 ---
 
-## Step 8 — EventBridge + CloudWatch
+## Step 3 — Set up the STAGING account (aws-staging)
+
+Run this ONE TIME inside your staging AWS account:
 
 ```bash
-bash infrastructure/eventbridge/setup_eventbridge.sh staging
-bash infrastructure/cloudwatch/setup_alarms.sh staging <api-gw-id>
-bash infrastructure/cloudfront/setup_cloudfront.sh staging
+export AWS_PROFILE=aws-staging
+
+bash infrastructure/scripts/setup_staging_account.sh \
+  vinodsharma412/aws-services \
+  your@email.com
 ```
 
-Repeat for prod.
+This script runs all 15 steps automatically:
+1. Creates `NSELambdaRole` (Lambda execution role)
+2. Sets up GitHub OIDC (no access keys needed in GitHub)
+3. Creates S3 buckets (frontend + avatars)
+4. Creates 13 DynamoDB tables
+5. Sets up SSM secrets (asks you for JWT key, passwords)
+6. Creates Cognito User Pool
+7. Creates SQS + SNS + SES
+8. Deploys Lambda Layer (X-Ray + AppConfig)
+9. Deploys Lambda functions (API + Worker)
+10. Creates API Gateway → Lambda
+11. Creates WebSocket API + DynamoDB Streams
+12. Creates Step Functions state machine
+13. Creates EventBridge scheduled rules
+14. Creates CloudWatch alarms + dashboard
+15. Creates CloudFront + AppConfig + KMS + Resource Groups
+
+At the end it prints the GitHub Secrets you need to add. **Copy them.**
 
 ---
 
-## Step 9 — GitHub Secrets
+## Step 4 — Set up the PROD account (aws-prod)
 
-Settings → Secrets → Actions. Add:
+```bash
+export AWS_PROFILE=aws-prod
 
-| Secret | Value |
+bash infrastructure/scripts/setup_prod_account.sh \
+  vinodsharma412/aws-services \
+  your@email.com
+```
+
+Same 15 steps as staging, but in a completely separate AWS account.
+It asks for confirmation before starting (this is production).
+
+---
+
+## Step 5 — Add GitHub Secrets
+
+Go to: **GitHub → your repo → Settings → Secrets → Actions**
+
+Add ALL of these (values shown at end of each setup script):
+
+### Staging account secrets
+```
+STAGING_ROLE_ARN          arn:aws:iam::<staging-account-id>:role/GitHubActionsRole-staging
+STAGING_ACCOUNT_ID        <12-digit staging account ID>
+STAGING_API_URL           https://<api-id>.execute-api.ap-south-1.amazonaws.com/api/v1
+S3_FRONTEND_BUCKET_STAGING  nse-frontend-<staging-account-id>
+```
+
+### Prod account secrets
+```
+PROD_ROLE_ARN             arn:aws:iam::<prod-account-id>:role/GitHubActionsRole-prod
+PROD_ACCOUNT_ID           <12-digit prod account ID>
+PROD_API_URL              https://<api-id>.execute-api.ap-south-1.amazonaws.com/api/v1
+S3_FRONTEND_BUCKET_PROD   nse-frontend-<prod-account-id>
+```
+
+> **No AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY needed.**
+> GitHub OIDC uses temporary tokens — more secure than stored keys.
+
+---
+
+## Step 6 — Set up GitHub Environments
+
+Go to: **GitHub → Settings → Environments**
+
+Create two environments:
+
+**`staging`** — No protection rules (auto-deploy)
+- Click "New environment" → name: `staging`
+- No reviewers, no wait timer
+
+**`prod`** — Manual approval required
+- Click "New environment" → name: `prod`
+- Required reviewers: add your GitHub username
+- Optional: Add 5-minute wait timer
+
+---
+
+## Step 7 — First deploy
+
+```bash
+# Push to develop branch
+git add . && git commit -m "chore: initial deploy" && git push origin develop
+```
+
+Then:
+1. Go to **GitHub → Actions** — watch the pipeline run
+2. **Lint & Build** completes (~3 min)
+3. **Deploy → aws-staging** completes automatically (~2 min)
+4. Check: `curl https://<STAGING_API_URL>/health/`
+5. You see: **"Waiting for approval to deploy to aws-prod"**
+6. Click **Review deployments** → **Approve and deploy**
+7. **Deploy → aws-prod** completes (~2 min)
+
+---
+
+## Step 8 — Verify both environments
+
+```bash
+# Health check both
+make health
+
+# View staging logs live
+make logs STAGE=staging
+
+# View prod logs live
+make logs STAGE=prod
+```
+
+**AWS Console verification:**
+
+| Service | Where to look |
 |---|---|
-| `AWS_ACCESS_KEY_ID` | IAM access key |
-| `AWS_SECRET_ACCESS_KEY` | IAM secret key |
-| `S3_FRONTEND_BUCKET` | `nse-frontend-{account-id}` |
-| `STAGING_API_URL` | `https://<id>.execute-api.ap-south-1.amazonaws.com/api/v1` |
-| `PROD_API_URL` | `https://<id>.execute-api.ap-south-1.amazonaws.com/api/v1` |
-
-Settings → Environments. Create:
-- `staging` — no protection rules
-- `prod` — Required reviewers: your GitHub username
+| Lambda | Console → Lambda → Functions |
+| DynamoDB | Console → DynamoDB → Tables |
+| API Gateway | Console → API Gateway → APIs |
+| Cognito | Console → Cognito → User pools |
+| CloudWatch | Console → CloudWatch → Dashboards → `NSE-Operations-staging` |
+| X-Ray | Console → CloudWatch → X-Ray traces |
 
 ---
 
-## Step 10 — First deploy
+## Step 9 — Create admin user
+
+After first deploy, create your admin user in Cognito:
 
 ```bash
-git add . && git commit -m "feat: serverless migration" && git push origin develop
+# Staging
+AWS_PROFILE=aws-staging aws cognito-idp admin-create-user \
+  --user-pool-id $(AWS_PROFILE=aws-staging aws ssm get-parameter \
+    --name /nse/staging/cognito-user-pool-id \
+    --query Parameter.Value --output text) \
+  --username admin \
+  --user-attributes Name=email,Value=your@email.com Name=email_verified,Value=true \
+    "Name=custom:role,Value=admin" \
+  --temporary-password "Nse@2025!" \
+  --message-action SUPPRESS \
+  --region ap-south-1
+
+# Prod (same command with aws-prod profile)
 ```
 
-Watch GitHub Actions: Lint → Build → Deploy STAGING → Approve → Deploy PROD.
+Log in at the frontend URL → change password on first login.
 
 ---
 
-## Daily workflow after initial setup
+## Cost check (should be $0)
 
 ```bash
-# Make changes locally, test on localhost:9000
-# Push to develop → auto-deploys staging in 2 min
-# Approve in GitHub UI → prod deployed in 1 min
+# Check AWS bill for staging account
+AWS_PROFILE=aws-staging aws ce get-cost-and-usage \
+  --time-period Start=$(date -d "1 month ago" +%Y-%m-01),End=$(date +%Y-%m-%d) \
+  --granularity MONTHLY \
+  --metrics BlendedCost \
+  --query "ResultsByTime[0].Total.BlendedCost.Amount" \
+  --region us-east-1
 
-make logs STAGE=staging     # watch CloudWatch logs live
-make health                 # verify both stages
+# Should output: "0.0000000000"
 ```
+
+If you see charges, check if you accidentally enabled paid services (EC2, RDS, etc.).

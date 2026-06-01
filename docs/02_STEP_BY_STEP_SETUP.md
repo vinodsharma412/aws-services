@@ -1,252 +1,347 @@
-# Step-by-Step Setup — Two AWS Accounts (Staging + Prod)
+# Step-by-Step AWS Setup — Switch Role (Staging + Prod)
 
-> **Read this first. Do every step in order. Don't skip.**
+## Concept: Switch Role vs separate access keys
 
----
+```
+WITHOUT switch role (bad):           WITH switch role (correct):
+┌──────────────────────────┐         ┌──────────────────────────┐
+│ aws-staging account      │         │ master account (yours)    │
+│   IAM user: vinod        │         │   IAM user: vinod        │
+│   Access key #1          │         │   ONE access key          │
+└──────────────────────────┘         └────────────┬─────────────┘
+┌──────────────────────────┐                      │ STS AssumeRole
+│ aws-prod account         │         ┌────────────▼─────────────┐
+│   IAM user: vinod        │         │ aws-staging account       │
+│   Access key #2          │         │   Role: CrossAccountRole  │
+└──────────────────────────┘         └──────────────────────────┘
+                                     ┌──────────────────────────┐
+2 IAM users, 2 access keys,          │ aws-prod account          │
+2 passwords to manage               │   Role: CrossAccountRole  │
+                                     └──────────────────────────┘
 
-## Before you start — what you need
-
-- [ ] **Two AWS accounts** (free, see Step 0)
-- [ ] **AWS CLI installed** on your machine
-- [ ] **GitHub account** with the `aws-services` repo
-- [ ] **Your email address** (for alerts)
-- [ ] **~60 minutes** total
-
----
-
-## Step 0 — Create two AWS accounts
-
-You need **two separate AWS accounts**:
-- `aws-staging` — developers test here (auto-deploys on every push)
-- `aws-prod` — real users here (manual approval required)
-
-### 0a. Create accounts via AWS Organizations (recommended)
-
-AWS Organizations lets you manage both accounts from a single "master" account.
-The benefit: one login, one billing, separate IAM per account.
-
-1. Go to [aws.amazon.com](https://aws.amazon.com) → **Create a Free Account**
-2. This becomes your **master/management account**
-3. In the AWS Console → **AWS Organizations** → **Add an AWS account**
-4. Create `aws-staging` account (give it a unique email, e.g. `yourname+staging@gmail.com`)
-5. Create `aws-prod` account (unique email, e.g. `yourname+prod@gmail.com`)
-
-Each account gets its own 12-month free tier from creation date.
-
-### 0b. Alternative: Two completely independent accounts
-
-Just create two separate AWS accounts at [aws.amazon.com](https://aws.amazon.com).
-Use different email addresses. No Organizations needed.
+                                     1 IAM user, 1 access key,
+                                     1 password — switch roles freely
+```
 
 ---
 
-## Step 1 — Install and configure AWS CLI
+## Before you start
+
+- [ ] **Three AWS accounts** (or AWS Organizations)
+  - Master account (your personal/main account — has IAM user)
+  - aws-staging account (separate account, only has IAM roles — no users)
+  - aws-prod account (separate account, only has IAM roles — no users)
+- [ ] AWS CLI installed: `pip install awscli`
+- [ ] GitHub repo: `vinodsharma412/aws-services`
+- [ ] Your email address
+
+---
+
+## Step 1 — Create three AWS accounts
+
+### Option A: AWS Organizations (recommended for learning)
+
+This is the enterprise pattern. One master account bills everything.
+
+1. Create a **master account** at [aws.amazon.com](https://aws.amazon.com)
+2. In master console → **AWS Organizations** → **Create organization**
+3. **Add an AWS account**:
+   - Name: `aws-staging`
+   - Email: `yourname+staging@gmail.com`
+4. **Add an AWS account**:
+   - Name: `aws-prod`
+   - Email: `yourname+prod@gmail.com`
+
+AWS creates sub-accounts automatically. No separate sign-up needed.
+
+### Option B: Three independent accounts (simpler)
+
+Just create three accounts at [aws.amazon.com](https://aws.amazon.com) with different emails.
+Choose this if you don't want Organizations complexity.
+
+---
+
+## Step 2 — Create ONE IAM user in master account only
+
+All your credentials live here. Staging/prod have no IAM users.
+
+1. Log into **master account** console
+2. Go to **IAM → Users → Create user**
+3. Username: `vinod` (or your name)
+4. Attach policy: `AdministratorAccess`
+5. **Security credentials → Create access key**
+6. Download the CSV — you'll need these in Step 5
+
+---
+
+## Step 3 — Create Cross-Account Role in STAGING account
+
+You need to temporarily log into the staging account once to create this role.
+
+### How to log into staging account console
+
+**If using AWS Organizations:**
+- Master console → **AWS Organizations** → **Accounts** → `aws-staging`
+- Click **Access account** → opens staging console as `OrganizationAccountAccessRole`
+
+**If using independent accounts:**
+- Log in at console.aws.amazon.com with the `aws-staging` email
+
+### Run the script
 
 ```bash
-# Install AWS CLI
-pip install awscli
+# You need temporary staging account credentials (root or OrganizationAccountAccessRole)
+# Set them as environment variables temporarily:
 
-# Configure profiles (one per account)
-aws configure --profile aws-staging
-# Enter: Access Key ID, Secret Access Key, region (ap-south-1), output (json)
+AWS_ACCESS_KEY_ID=<staging-temp-key> \
+AWS_SECRET_ACCESS_KEY=<staging-temp-secret> \
+AWS_DEFAULT_REGION=ap-south-1 \
+bash infrastructure/iam/setup_switch_role.sh staging <MASTER_ACCOUNT_ID>
+```
 
-aws configure --profile aws-prod
-# Enter: Access Key ID, Secret Access Key, region (ap-south-1), output (json)
+Copy the output. You'll see:
+```
+Role ARN: arn:aws:iam::111111111111:role/CrossAccountAccessRole
+External ID: nse-staging-access
+```
 
-# Test
+---
+
+## Step 4 — Create Cross-Account Role in PROD account
+
+Same process, but in the prod account:
+
+```bash
+AWS_ACCESS_KEY_ID=<prod-temp-key> \
+AWS_SECRET_ACCESS_KEY=<prod-temp-secret> \
+AWS_DEFAULT_REGION=ap-south-1 \
+bash infrastructure/iam/setup_switch_role.sh prod <MASTER_ACCOUNT_ID>
+```
+
+Copy the output:
+```
+Role ARN: arn:aws:iam::222222222222:role/CrossAccountAccessRole
+External ID: nse-prod-access
+```
+
+---
+
+## Step 5 — Configure AWS CLI on your laptop (Switch Role profiles)
+
+This is the key step. You only configure the master account credentials once,
+then profiles switch roles automatically.
+
+### Option A: Run the config script (recommended)
+
+```bash
+bash infrastructure/iam/configure_aws_profiles.sh \
+  <MASTER_ACCESS_KEY_ID> \
+  <MASTER_SECRET_ACCESS_KEY> \
+  <STAGING_ACCOUNT_ID> \
+  <PROD_ACCOUNT_ID>
+```
+
+This script:
+- Writes master credentials to `~/.aws/credentials`
+- Writes switch role profiles to `~/.aws/config`
+- Tests both profiles
+
+### Option B: Edit files manually
+
+**`~/.aws/credentials`** — only master account keys:
+```ini
+[default]
+aws_access_key_id = AKIA...YOUR_MASTER_KEY...
+aws_secret_access_key = ...YOUR_MASTER_SECRET...
+```
+
+**`~/.aws/config`** — switch role profiles:
+```ini
+[default]
+region = ap-south-1
+output = json
+
+[profile aws-staging]
+role_arn = arn:aws:iam::<STAGING_ACCOUNT_ID>:role/CrossAccountAccessRole
+source_profile = default
+external_id = nse-staging-access
+region = ap-south-1
+role_session_name = aws-staging-session
+
+[profile aws-prod]
+role_arn = arn:aws:iam::<PROD_ACCOUNT_ID>:role/CrossAccountAccessRole
+source_profile = default
+external_id = nse-prod-access
+region = ap-south-1
+role_session_name = aws-prod-session
+```
+
+### Test it
+
+```bash
+# Should show STAGING account ID
 aws sts get-caller-identity --profile aws-staging
+
+# Should show PROD account ID
 aws sts get-caller-identity --profile aws-prod
-```
 
-**How to get access keys per account:**
-1. Log into each AWS account console
-2. IAM → Users → Create user → Attach `AdministratorAccess`
-3. Security credentials → Create access key → Download CSV
-
----
-
-## Step 2 — Clone the repository
-
-```bash
-git clone https://github.com/vinodsharma412/aws-services.git
-cd aws-services
-git checkout develop
+# Should show MASTER account ID
+aws sts get-caller-identity
 ```
 
 ---
 
-## Step 3 — Set up the STAGING account (aws-staging)
+## Step 6 — Console Switch Role (browser)
 
-Run this ONE TIME inside your staging AWS account:
+For the AWS Console (browser), you switch roles manually:
+
+1. Log into **master account** console
+2. Click your **username** (top right) → **Switch Role**
+3. Fill in:
+   - Account: `<STAGING_ACCOUNT_ID>` (e.g. `111111111111`)
+   - Role: `CrossAccountAccessRole`
+   - Display name: `aws-staging` (for easy identification)
+   - Color: Orange (staging)
+4. Click **Switch Role**
+5. You're now in the staging account — notice "CrossAccountAccessRole @ 111111111111" in the header
+6. To go back: click the role name → **Switch Back**
+7. Repeat for prod with a different color (e.g. red)
+
+**Tip:** AWS saves your last 5 switched roles in a dropdown — you'll never type account IDs again after the first time.
+
+---
+
+## Step 7 — Set up staging infrastructure
+
+Now use the switch role profile:
 
 ```bash
 export AWS_PROFILE=aws-staging
 
+# Verify you're in the right account
+aws sts get-caller-identity --query Account --output text
+# → should print STAGING_ACCOUNT_ID
+
+# Run full setup (15 steps, ~30 min)
 bash infrastructure/scripts/setup_staging_account.sh \
   vinodsharma412/aws-services \
   your@email.com
 ```
 
-This script runs all 15 steps automatically:
-1. Creates `NSELambdaRole` (Lambda execution role)
-2. Sets up GitHub OIDC (no access keys needed in GitHub)
-3. Creates S3 buckets (frontend + avatars)
-4. Creates 13 DynamoDB tables
-5. Sets up SSM secrets (asks you for JWT key, passwords)
-6. Creates Cognito User Pool
-7. Creates SQS + SNS + SES
-8. Deploys Lambda Layer (X-Ray + AppConfig)
-9. Deploys Lambda functions (API + Worker)
-10. Creates API Gateway → Lambda
-11. Creates WebSocket API + DynamoDB Streams
-12. Creates Step Functions state machine
-13. Creates EventBridge scheduled rules
-14. Creates CloudWatch alarms + dashboard
-15. Creates CloudFront + AppConfig + KMS + Resource Groups
-
-At the end it prints the GitHub Secrets you need to add. **Copy them.**
-
 ---
 
-## Step 4 — Set up the PROD account (aws-prod)
+## Step 8 — Set up prod infrastructure
 
 ```bash
 export AWS_PROFILE=aws-prod
 
+# Verify account
+aws sts get-caller-identity --query Account --output text
+# → should print PROD_ACCOUNT_ID
+
+# Run full setup
 bash infrastructure/scripts/setup_prod_account.sh \
   vinodsharma412/aws-services \
   your@email.com
 ```
 
-Same 15 steps as staging, but in a completely separate AWS account.
-It asks for confirmation before starting (this is production).
+---
+
+## Step 9 — GitHub Secrets (still needed for CI/CD)
+
+Go to: **GitHub → repo → Settings → Secrets → Actions**
+
+The setup scripts printed these at the end. Add them:
+
+```
+STAGING_ROLE_ARN           arn:aws:iam::<STAGING_ID>:role/GitHubActionsRole-staging
+STAGING_ACCOUNT_ID         <STAGING_ACCOUNT_ID>
+STAGING_API_URL            https://<id>.execute-api.ap-south-1.amazonaws.com/api/v1
+S3_FRONTEND_BUCKET_STAGING nse-frontend-<STAGING_ACCOUNT_ID>
+
+PROD_ROLE_ARN              arn:aws:iam::<PROD_ID>:role/GitHubActionsRole-prod
+PROD_ACCOUNT_ID            <PROD_ACCOUNT_ID>
+PROD_API_URL               https://<id>.execute-api.ap-south-1.amazonaws.com/api/v1
+S3_FRONTEND_BUCKET_PROD    nse-frontend-<PROD_ACCOUNT_ID>
+```
+
+> GitHub Actions uses OIDC (not switch role) — but the concept is the same:
+> it assumes a specific IAM role in each account per job.
 
 ---
 
-## Step 5 — Add GitHub Secrets
-
-Go to: **GitHub → your repo → Settings → Secrets → Actions**
-
-Add ALL of these (values shown at end of each setup script):
-
-### Staging account secrets
-```
-STAGING_ROLE_ARN          arn:aws:iam::<staging-account-id>:role/GitHubActionsRole-staging
-STAGING_ACCOUNT_ID        <12-digit staging account ID>
-STAGING_API_URL           https://<api-id>.execute-api.ap-south-1.amazonaws.com/api/v1
-S3_FRONTEND_BUCKET_STAGING  nse-frontend-<staging-account-id>
-```
-
-### Prod account secrets
-```
-PROD_ROLE_ARN             arn:aws:iam::<prod-account-id>:role/GitHubActionsRole-prod
-PROD_ACCOUNT_ID           <12-digit prod account ID>
-PROD_API_URL              https://<api-id>.execute-api.ap-south-1.amazonaws.com/api/v1
-S3_FRONTEND_BUCKET_PROD   nse-frontend-<prod-account-id>
-```
-
-> **No AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY needed.**
-> GitHub OIDC uses temporary tokens — more secure than stored keys.
-
----
-
-## Step 6 — Set up GitHub Environments
+## Step 10 — GitHub Environments
 
 Go to: **GitHub → Settings → Environments**
 
-Create two environments:
-
-**`staging`** — No protection rules (auto-deploy)
-- Click "New environment" → name: `staging`
-- No reviewers, no wait timer
-
-**`prod`** — Manual approval required
-- Click "New environment" → name: `prod`
-- Required reviewers: add your GitHub username
-- Optional: Add 5-minute wait timer
-
----
-
-## Step 7 — First deploy
-
-```bash
-# Push to develop branch
-git add . && git commit -m "chore: initial deploy" && git push origin develop
-```
-
-Then:
-1. Go to **GitHub → Actions** — watch the pipeline run
-2. **Lint & Build** completes (~3 min)
-3. **Deploy → aws-staging** completes automatically (~2 min)
-4. Check: `curl https://<STAGING_API_URL>/health/`
-5. You see: **"Waiting for approval to deploy to aws-prod"**
-6. Click **Review deployments** → **Approve and deploy**
-7. **Deploy → aws-prod** completes (~2 min)
-
----
-
-## Step 8 — Verify both environments
-
-```bash
-# Health check both
-make health
-
-# View staging logs live
-make logs STAGE=staging
-
-# View prod logs live
-make logs STAGE=prod
-```
-
-**AWS Console verification:**
-
-| Service | Where to look |
+| Environment | Protection |
 |---|---|
-| Lambda | Console → Lambda → Functions |
-| DynamoDB | Console → DynamoDB → Tables |
-| API Gateway | Console → API Gateway → APIs |
-| Cognito | Console → Cognito → User pools |
-| CloudWatch | Console → CloudWatch → Dashboards → `NSE-Operations-staging` |
-| X-Ray | Console → CloudWatch → X-Ray traces |
+| `staging` | None — auto-deploy on push |
+| `prod` | Required reviewer: your GitHub username |
 
 ---
 
-## Step 9 — Create admin user
-
-After first deploy, create your admin user in Cognito:
+## Step 11 — First deploy
 
 ```bash
-# Staging
-AWS_PROFILE=aws-staging aws cognito-idp admin-create-user \
-  --user-pool-id $(AWS_PROFILE=aws-staging aws ssm get-parameter \
-    --name /nse/staging/cognito-user-pool-id \
-    --query Parameter.Value --output text) \
-  --username admin \
-  --user-attributes Name=email,Value=your@email.com Name=email_verified,Value=true \
-    "Name=custom:role,Value=admin" \
-  --temporary-password "Nse@2025!" \
-  --message-action SUPPRESS \
-  --region ap-south-1
-
-# Prod (same command with aws-prod profile)
+git push origin develop
 ```
 
-Log in at the frontend URL → change password on first login.
+GitHub Actions:
+1. Assumes `GitHubActionsRole-staging` in aws-staging (OIDC, no keys)
+2. Deploys Lambda + S3 to staging
+3. Health check passes
+4. Waits for your approval
+5. You click **Approve** in GitHub
+6. Assumes `GitHubActionsRole-prod` in aws-prod (OIDC, no keys)
+7. Deploys Lambda + S3 to prod
 
 ---
 
-## Cost check (should be $0)
+## Daily workflow after setup
 
 ```bash
-# Check AWS bill for staging account
-AWS_PROFILE=aws-staging aws ce get-cost-and-usage \
-  --time-period Start=$(date -d "1 month ago" +%Y-%m-01),End=$(date +%Y-%m-%d) \
-  --granularity MONTHLY \
-  --metrics BlendedCost \
-  --query "ResultsByTime[0].Total.BlendedCost.Amount" \
-  --region us-east-1
+# Staging work
+export AWS_PROFILE=aws-staging
+make logs STAGE=staging          # view staging logs
+make dynamo-tables               # create a new table in staging
 
-# Should output: "0.0000000000"
+# Prod work (read-only normally)
+export AWS_PROFILE=aws-prod
+make health                      # check prod health
+aws logs tail /aws/lambda/nse-api-prod --follow  # prod logs
+
+# Deploy (always go through git)
+git push origin develop          # → auto staging → approve → prod
 ```
 
-If you see charges, check if you accidentally enabled paid services (EC2, RDS, etc.).
+---
+
+## Switch Role quick reference
+
+| Action | Command |
+|---|---|
+| Use staging profile | `export AWS_PROFILE=aws-staging` |
+| Use prod profile | `export AWS_PROFILE=aws-prod` |
+| Use master account | `unset AWS_PROFILE` |
+| Verify current account | `aws sts get-caller-identity` |
+| Console switch role | Username → Switch Role → enter account ID |
+| Console switch back | Role name (top right) → Switch Back |
+
+---
+
+## Security: why switch role is better than multiple keys
+
+| Concern | Multiple keys | Switch Role |
+|---|---|---|
+| How many credentials? | 1 key per account | 1 key total |
+| Key rotation | Rotate in every account | Rotate once (master) |
+| Accidental prod access | Easy — two separate profiles | Hard — explicit assume required |
+| MFA enforcement | Per-account (inconsistent) | Once on master account |
+| If key leaked | Compromised account only | All accounts (but can block via MFA condition) |
+| Audit trail | Per-account CloudTrail | Cross-account via Organizations |
+| Best for | Simple/personal projects | Enterprise, teams, compliance |
+
+**Recommendation:** Enable MFA on your master account. Then add `mfa_serial` to
+`~/.aws/config` profiles. Every switch role will require your MFA code.
+This means even if your access key is leaked, the attacker can't switch roles.

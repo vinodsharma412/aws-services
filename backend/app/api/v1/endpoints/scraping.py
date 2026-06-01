@@ -1,41 +1,35 @@
-"""Amazon ASIN scraping job endpoints + SSE event streams.
+"""Amazon ASIN scraping job endpoints.
+
+Architecture change — Lambda edition:
+    SSE (Server-Sent Events) has been REMOVED because API Gateway + Lambda
+    enforces a hard 29-second response timeout that breaks long-lived streams.
+
+    Real-time progress is now delivered via POLLING:
+        Frontend polls  GET /scraping/jobs         every 2 s (job list)
+        Frontend polls  GET /scraping/jobs/{id}    every 2 s (single job)
+
+    The scraping itself runs in a separate SQS-triggered Lambda:
+        POST /scraping/jobs
+          → creates DynamoDB records
+          → publishes task_ids to SQS
+          → SQS triggers nse-scraping-worker-{stage} Lambda
+          → worker scrapes Amazon, updates DynamoDB
+          → next frontend poll sees updated status
 
 REST endpoints:
-    POST  /jobs              — create a new scraping job
-    GET   /jobs              — list jobs (ADMIN/MANAGER see all; VIEWER sees own)
-    GET   /jobs/{job_id}     — get a single job with task detail
-
-SSE streams (text/event-stream):
-    GET   /events            — live job list, updates on any state change
-    GET   /jobs/{job_id}/events  — live single-job detail, closes when done
-
-AWS difference vs. original:
-    - No SQLAlchemy session. Jobs and tasks stored in DynamoDB via
-      ``crud.scraping_dynamo``.
-    - Primary keys are UUID strings, not integers.
-    - SSE streams query DynamoDB directly (no SessionLocal pool needed).
-    - SSE endpoints should be called via EC2 directly (not API Gateway) because
-      API Gateway has a hard 29-second timeout that breaks long-running streams.
-      Set REACT_APP_SSE_URL to the EC2 public URL in the React .env file.
+    POST  /jobs          — create a new scraping job (enqueue all ASINs)
+    GET   /jobs          — list jobs visible to the current user
+    GET   /jobs/{job_id} — single job with full task detail
 """
 
-import asyncio
-import json
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import StreamingResponse
 
 from app.crud import scraping_dynamo
 from app.dependencies import get_current_active_user
 from app.schemas.scraping import JobCreate, JobOut
 from app.services.scraping_queue import enqueue
-
-#: Seconds between SSE polls while tasks are actively running or pending.
-_SSE_ACTIVE_INTERVAL = 1
-
-#: Seconds between SSE polls when all tasks are idle (saves DynamoDB RCUs).
-_SSE_IDLE_INTERVAL = 5
 
 router = APIRouter()
 
@@ -47,7 +41,7 @@ def _task_to_dict(t: dict) -> dict:
     """Normalise a DynamoDB task item for JSON output.
 
     Args:
-        t: Raw DynamoDB task dict with UUID string keys.
+        t: Raw DynamoDB task dict.
 
     Returns:
         Normalised dict with ``id`` mapped from ``task_id``.
@@ -67,15 +61,15 @@ def _task_to_dict(t: dict) -> dict:
 def _job_to_dict(job: dict, tasks: Optional[list] = None) -> dict:
     """Normalise a DynamoDB job item for JSON output.
 
-    When *tasks* is provided, counters are derived from the actual task rows
-    to protect against counter drift after mid-flight crashes.
+    When tasks are provided, counters are derived from live task rows rather
+    than the potentially-stale counter fields on the job record.
 
     Args:
-        job: Raw DynamoDB job dict.
-        tasks: Optional list of task dicts for this job.
+        job:   Raw DynamoDB job dict.
+        tasks: Optional list of task dicts (for accurate live counters).
 
     Returns:
-        Normalised dict with ``id`` mapped from ``job_id`` and live counters.
+        Normalised job dict.
     """
     if tasks is not None:
         pending   = sum(1 for t in tasks if t.get("status") == "pending")
@@ -110,18 +104,20 @@ def create_job(
     payload: JobCreate,
     current_user: dict = Depends(get_current_active_user),
 ) -> dict:
-    """Create a new scraping job and enqueue all ASINs.
+    """Create a new scraping job and enqueue all ASINs to SQS.
 
-    Creates one ``ScrapingJob`` record and one ``ScrapingTask`` per ASIN in
-    DynamoDB, then puts each task_id onto the in-process queue so the background
-    Playwright worker picks them up immediately.
+    Creates one ScrapingJob record and one ScrapingTask per ASIN in DynamoDB,
+    then publishes each task_id to SQS.  The nse-scraping-worker Lambda picks
+    them up automatically via its SQS event-source mapping.
+
+    Frontend tracks progress by polling GET /scraping/jobs/{id} every 2 seconds.
 
     Args:
-        payload: ``JobCreate`` body with a validated list of ASIN strings.
+        payload:      Validated JobCreate body with a list of ASIN strings.
         current_user: Authenticated user dict from DynamoDB.
 
     Returns:
-        The created job serialised as ``JobOut``, including the full task list.
+        The created job as JobOut (with full task list and initial counters).
     """
     asins = payload.asins
     job = scraping_dynamo.create_job(
@@ -144,11 +140,14 @@ def list_jobs(current_user: dict = Depends(get_current_active_user)) -> List[dic
 
     ADMIN and MANAGER see all jobs; VIEWER sees only their own.
 
+    Poll this endpoint every 2 seconds while jobs are active to track
+    progress (replaces the previous SSE /events stream).
+
     Args:
-        current_user: Authenticated user dict determining visibility scope.
+        current_user: Authenticated user dict.
 
     Returns:
-        List of jobs serialised as ``JobOut`` (without task detail).
+        List of jobs as JobOut (without task detail — use GET /jobs/{id} for tasks).
     """
     if current_user.get("role") == "viewer":
         jobs = scraping_dynamo.list_jobs_for_user(current_user["user_id"])
@@ -165,12 +164,15 @@ def get_job(
 ) -> dict:
     """Retrieve a single scraping job with full task detail.
 
+    Poll this endpoint every 2 seconds to track progress of an active job.
+    Stop polling when  pending == 0  and  running == 0.
+
     Args:
-        job_id: UUID string primary key of the job.
+        job_id:       UUID string primary key of the job.
         current_user: Used for ownership check when role is VIEWER.
 
     Returns:
-        Job serialised as ``JobOut`` including all tasks and scraped product data.
+        Job as JobOut including all tasks and scraped product data.
 
     Raises:
         HTTPException 404: If the job does not exist.
@@ -188,127 +190,3 @@ def get_job(
 
     tasks = scraping_dynamo.get_tasks_for_job(job_id)
     return _job_to_dict(job, tasks=tasks)
-
-
-# ── SSE streams ────────────────────────────────────────────────────────────────
-
-
-@router.get("/events")
-async def jobs_event_stream(
-    current_user: dict = Depends(get_current_active_user),
-) -> StreamingResponse:
-    """SSE stream emitting the full job list whenever state changes.
-
-    Polls DynamoDB every ``_SSE_ACTIVE_INTERVAL`` seconds while any job has
-    pending/running tasks, and every ``_SSE_IDLE_INTERVAL`` seconds when idle.
-    Only sends an SSE frame when the payload differs from the last send.
-
-    Note: This endpoint must be called directly on EC2 (via ``SSE_URL``), not
-    through API Gateway which enforces a 29-second integration timeout.
-
-    Args:
-        current_user: Used to scope visibility (VIEWER sees own jobs only).
-
-    Returns:
-        ``StreamingResponse`` with ``Content-Type: text/event-stream``.
-    """
-    user_id   = current_user["user_id"]
-    user_role = current_user.get("role", "viewer")
-
-    def fetch() -> str:
-        if user_role == "viewer":
-            jobs = scraping_dynamo.list_jobs_for_user(user_id)
-        else:
-            jobs = scraping_dynamo.list_all_jobs()
-        return json.dumps([_job_to_dict(j) for j in jobs])
-
-    async def generate():
-        last = None
-        while True:
-            try:
-                payload = await asyncio.to_thread(fetch)
-            except Exception:  # noqa: BLE001
-                await asyncio.sleep(2)
-                continue
-
-            if payload != last:
-                yield f"data: {payload}\n\n"
-                last = payload
-
-            has_active = any(
-                j.get("pending", 0) > 0 or j.get("running", 0) > 0
-                for j in json.loads(payload)
-            )
-            await asyncio.sleep(
-                _SSE_ACTIVE_INTERVAL if has_active else _SSE_IDLE_INTERVAL
-            )
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
-@router.get("/jobs/{job_id}/events")
-async def job_event_stream(
-    job_id: str,
-    current_user: dict = Depends(get_current_active_user),
-) -> StreamingResponse:
-    """SSE stream for a single job — closes automatically when all tasks finish.
-
-    Polls DynamoDB every ``_SSE_ACTIVE_INTERVAL`` seconds and sends the current
-    job state only when it differs from the previous frame.  The generator exits
-    (closing the stream) once ``pending == 0`` and ``running == 0``.
-
-    Note: Call via ``SSE_URL`` (direct EC2), not through API Gateway.
-
-    Args:
-        job_id: UUID string of the job to stream.
-        current_user: Used for VIEWER ownership enforcement.
-
-    Returns:
-        ``StreamingResponse`` with ``Content-Type: text/event-stream``.
-    """
-    user_id   = current_user["user_id"]
-    user_role = current_user.get("role", "viewer")
-
-    def fetch():
-        job = scraping_dynamo.get_job(job_id)
-        if not job:
-            return None, False
-        if user_role == "viewer" and job.get("user_id") != user_id:
-            return None, False
-        tasks = scraping_dynamo.get_tasks_for_job(job_id)
-        data = _job_to_dict(job, tasks=tasks)
-        done = data["pending"] == 0 and data["running"] == 0
-        return json.dumps(data), done
-
-    async def generate():
-        last = None
-        while True:
-            try:
-                payload, done = await asyncio.to_thread(fetch)
-            except Exception:  # noqa: BLE001
-                await asyncio.sleep(1)
-                continue
-
-            if payload is None:
-                yield f"data: {json.dumps({'error': 'not_found'})}\n\n"
-                break
-
-            if payload != last:
-                yield f"data: {payload}\n\n"
-                last = payload
-
-            if done:
-                break
-
-            await asyncio.sleep(_SSE_ACTIVE_INTERVAL)
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-

@@ -1,268 +1,171 @@
-# Complete AWS Solution Architecture — NSE Stock Dashboard
+# Architecture — 40+ AWS Free-Tier Services, Zero EC2
 
-## Full System Diagram
+## All AWS services used
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        BROWSER (React SPA)                                  │
-│              http://nse-frontend-<id>.s3-website.ap-south-1.amazonaws.com   │
-└─────────┬────────────────────────────────────────────┬───────────────────────┘
-          │  REST API calls (JSON)                      │  SSE streams only
-          │  Authorization: Bearer JWT                   │  (bypass API GW — 29s limit)
-          ▼                                             ▼
-┌──────────────────────────┐              ┌────────────────────────────────────┐
-│   AWS API Gateway        │              │   EC2 Nginx :80 (direct)           │
-│   HTTP API               │              │   /scraping/events                 │
-│   ap-south-1             │              │   /scraping/jobs/{id}/events       │
-│                          │              └──────────────┬─────────────────────┘
-│   Stage: /prod           │                             │
-│   Routes:                │                             │
-│   ANY /{proxy+}          │                             │
-│   → EC2 integration      │                             │
-└───────────┬──────────────┘                             │
-            │  HTTP proxy                                │
-            │  (all REST routes)                         │
-            ▼                                            ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     EC2 t2.micro  (ap-south-1 / Mumbai)                     │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  Nginx  :80                                                          │   │
-│  │   /api/*  →  FastAPI :9000                                           │   │
-│  │   /static/* → FastAPI :9000 (S3 avatars redirect)                   │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  FastAPI (uvicorn :9000) — systemd: nse-api.service                  │   │
-│  │   /api/v1/auth/*     — login → JWT                                   │   │
-│  │   /api/v1/users/*    — CRUD users (DynamoDB)                         │   │
-│  │   /api/v1/stocks/*   — yfinance analysis, portfolio, watchlist        │   │
-│  │   /api/v1/scraping/* — job mgmt + SSE progress stream                │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  Playwright Worker — systemd: nse-worker.service                     │   │
-│  │   polls DynamoDB (status-index GSI)                                  │   │
-│  │   → scrape amazon.in → save ProductData to DynamoDB                  │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  IAM Instance Profile: NSEStockDashboardEC2Role                            │
-│   (DynamoDB: all nse_* tables | S3: nse-assets-* bucket)                   │
-└─────────────┬───────────────────────────────┬───────────────────────────────┘
-              │                               │
-              ▼                               ▼
-┌─────────────────────────┐    ┌──────────────────────────────────────────────┐
-│  AWS DynamoDB           │    │  AWS S3                                       │
-│  ap-south-1             │    │  ap-south-1                                   │
-│                         │    │                                               │
-│  Tables:                │    │  nse-frontend-<id>  (static website)         │
-│  nse_users              │    │   React build files (public read)            │
-│  nse_stock_transactions │    │                                               │
-│  nse_stock_watchlist    │    │  nse-assets-<id>  (private)                  │
-│  nse_scraping_jobs      │    │   avatars/user_*.jpg                         │
-│  nse_scraping_tasks     │    │   (signed URL or public per object)          │
-│  nse_product_data       │    │                                               │
-└─────────────────────────┘    └──────────────────────────────────────────────┘
-
-── Background automation (EventBridge + Lambda) ──────────────────────────────
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  AWS EventBridge (event bus + scheduled rules)                              │
-│                                                                             │
-│  Rule 1: cron(0 3 * * ? *)  daily 3 AM IST                                 │
-│   → Lambda: nse-universe-refresh                                            │
-│     downloads NSE EQUITY_L.csv → stores 1800+ symbols in DynamoDB          │
-│                                                                             │
-│  Rule 2: cron(0/30 6-16 ? * MON-FRI *)  every 30 min, market hours         │
-│   → Lambda: nse-screener-refresh                                            │
-│     pre-computes top 40 screener stocks → DynamoDB cache table              │
-│                                                                             │
-│  Rule 3: ec2-state-change  (EC2 starts/stops)                               │
-│   → Lambda: nse-health-notifier → SNS → email alert                        │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-── Observability (CloudWatch) ────────────────────────────────────────────────
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  AWS CloudWatch                                                             │
-│                                                                             │
-│  Log Groups:                                                                │
-│   /nse/api          ← FastAPI uvicorn logs (via CloudWatch Agent on EC2)   │
-│   /nse/worker       ← Playwright worker logs                                │
-│   /aws/lambda/nse-* ← Lambda function logs (automatic)                     │
-│   /aws/apigateway/nse-stock-api ← API Gateway access logs                  │
-│                                                                             │
-│  Metric Alarms:                                                             │
-│   EC2 CPU > 80%    → SNS email "High CPU on nse server"                    │
-│   EC2 Memory > 85% → SNS email (custom metric via CloudWatch Agent)        │
-│   API 5xx > 10/min → SNS email "API errors spiking"                        │
-│   Lambda errors    → SNS email                                              │
-│                                                                             │
-│  Dashboard: NSE-Stock-Dashboard                                             │
-│   Widgets: API request rate, EC2 CPU, DynamoDB consumed RCU/WCU,            │
-│            Lambda duration, S3 requests                                      │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Service Roles — Why Each AWS Service
-
-| Service | Role | Replaces |
-|---|---|---|
-| **S3 (frontend)** | Host React build (static website) | Local `npm start` |
-| **API Gateway HTTP API** | Single public HTTPS endpoint, rate limiting, throttling | Direct EC2 exposure |
-| **EC2 t2.micro** | Run FastAPI + Playwright (needs persistent process + SSE) | `uvicorn` on localhost |
-| **DynamoDB** | Store users, portfolio, scraping data (serverless, no patching) | PostgreSQL |
-| **S3 (assets)** | Store avatar images (cross-restart persistence) | Local `/static/avatars` |
-| **Lambda** | Background jobs (screener refresh, universe download) | Cron jobs on EC2 |
-| **EventBridge** | Trigger Lambdas on schedule (market hours) | `crontab` |
-| **CloudWatch** | Logs, metrics, alarms, dashboard | `tail -f` / Grafana |
-| **IAM** | Role-based access — EC2 never needs hard-coded credentials | `.env` AWS keys |
-
----
-
-## Why API Gateway + EC2 (not Lambda for everything)
-
-```
-Route Type        API Gateway + Lambda?    API Gateway + EC2?
-─────────────     ─────────────────────    ──────────────────
-REST endpoints    ✅ Works great            ✅ Works great
-SSE streaming     ❌ 29s timeout            ✅ nginx proxy_buffering off
-Playwright        ❌ 250MB limit            ✅ installed on EC2
-Worker polling    ❌ not event-driven       ✅ systemd service
-Cost (free tier)  ✅ 1M req free            ✅ 750h/mo free
-```
-
-Decision: **API Gateway as the entry point** for all REST calls, routing to EC2.
-SSE endpoints bypass API Gateway and hit EC2 Nginx directly on the same port.
-
----
-
-## Data Flow — Stock Analysis Request
-
-```
-User clicks "Analyse TCS"
-    ↓
-React: GET /api/v1/stocks/analyse/TCS.NS
-       Header: Authorization: Bearer eyJhbGci...
-    ↓
-API Gateway HTTP API
-  - Validates route: GET /prod/api/v1/stocks/analyse/{proxy}
-  - Forwards to EC2 integration URL with all headers
-    ↓
-EC2 Nginx :80 → FastAPI :9000
-    ↓
-dependencies.py: get_current_active_user()
-  - decode_token(JWT) → username = "admin"
-  - dynamo_users.query(username-index) → user dict
-  - assert user.is_active == True
-    ↓
-stocks.py endpoint: analyse("TCS.NS")
-  1. sentiment_service.analyze_sentiment("TCS.NS")
-     → Bing News RSS HTTP call (external)
-     → ThreadPoolExecutor: fetch og:description from 5 articles
-     → sentiment score = +0.35 (bullish)
-  2. stock_service.get_stock_analysis("TCS.NS", 0.35)
-     → _cached("analysis:TCS.NS", ..., ttl=1800)
-     → cache miss → _yf_info("TCS.NS") → curl_cffi → Yahoo Finance
-     → _yf_history("TCS.NS", "2y") → 2 years OHLCV
-     → _calculate_technicals(hist) → RSI, MACD, BB, Stoch, ATR...
-     → _generate_recommendation(info, tech, 0.35) → score=+6 → "Buy"
-     → _calc_valuation_metrics(info) → Graham Number, PEG, FCF yield
-     → _calculate_entry_exit(price, tech, info) → buy zone, targets, SL
-     → _get_sector_schemes("Technology") → PLI schemes list
-     → store in _cache dict (in-memory, 30 min TTL)
-    ↓
-Response JSON: 200 OK
-    ↓
-API Gateway: forward response to browser
-    ↓
-React: setAnalysis(res.data) → renders tabs
-```
-
----
-
-## Data Flow — Avatar Upload
-
-```
-User clicks Upload Avatar
-    ↓
-React: POST /api/v1/users/me/avatar
-       multipart/form-data; image.jpg
-    ↓
-API Gateway → EC2 FastAPI
-    ↓
-users.py: upload_avatar()
-  - validate MIME type (image/jpeg ✅)
-  - validate size < 3 MB ✅
-  - call s3_storage.upload_avatar(bytes, "image/jpeg", user_id, "jpg")
-    → s3.put_object(Bucket="nse-assets-<id>", Key="avatars/user_1_abc123.jpg")
-    → returns "https://nse-assets-<id>.s3.ap-south-1.amazonaws.com/avatars/..."
-  - dynamo_users.update_item: set avatar_url = S3 URL
-    ↓
-Response: 200 OK — updated user dict with new avatar_url
-```
-
----
-
-## EventBridge Pub/Sub Pattern
-
-```
-PUBLISHER                       EVENT BUS              SUBSCRIBER
-─────────                       ─────────              ──────────
-EventBridge Scheduler           default bus            Lambda: nse-screener-refresh
-cron(0/30 6-16 MON-FRI)   ──►  event          ──►     → calls screen_stocks()
-                                                        → writes to DynamoDB
-                                                          screener_cache table
-
-EC2 instance state change   ──► event          ──►     Lambda: nse-health-notifier
-(start / stop / terminate)                              → SNS → Email to admin
-
-Custom event from FastAPI:  ──► event          ──►     Lambda: nse-email-alert
-events.put_events({                                     → sends email via SES
-  "Source": "nse.scraping",
-  "DetailType": "JobCompleted",
-  "Detail": {"job_id": "...", "status": "done"}
-})
-```
-
----
-
-## DynamoDB Access Patterns
-
-| Endpoint | Table | Operation | Index Used |
+| # | Service | Role | Free Tier |
 |---|---|---|---|
-| Login | nse_users | Query | username-index GSI |
-| Get user by ID | nse_users | GetItem | Primary key |
-| List all users | nse_users | Scan | — (admin only) |
-| Portfolio | nse_stock_transactions | Query | user-transactions-index GSI |
-| Watchlist | nse_stock_watchlist | Query | user-watchlist-index GSI |
-| Check dupe symbol | nse_stock_watchlist | Query | user-symbol-index GSI |
-| List jobs | nse_scraping_jobs | Query | user-jobs-index GSI |
-| Job tasks | nse_scraping_tasks | Query | job-tasks-index GSI |
-| Pending tasks | nse_scraping_tasks | Query | status-index GSI |
-| Product data | nse_product_data | GetItem | Primary key (task_id) |
+| 1 | **API Gateway HTTP API** | REST entry point, rate limiting, CORS | 1M req/month forever |
+| 2 | **API Gateway WebSocket API** | Real-time scraping progress push | 1M conn min/month 12 mo |
+| 3 | **Lambda** (6 functions) | All backend compute | 1M req + 400K GB-s/month forever |
+| 4 | **Lambda Layers** | Shared X-Ray + utilities code | Same Lambda free tier |
+| 5 | **DynamoDB** | Primary database (12 tables) | 25 GB + 25 RCU/WCU forever |
+| 6 | **DynamoDB Streams** | Event-driven WS push on task update | Included with DynamoDB |
+| 7 | **DynamoDB TTL** | Auto-expire WebSocket connections | Included with DynamoDB |
+| 8 | **S3** | Frontend hosting + avatar images | 5 GB, 20K GET / 12 months |
+| 9 | **S3 Event Notifications** | Trigger Rekognition on avatar upload | Included with S3 |
+| 10 | **S3 Lifecycle Policies** | Archive old scraping data to Glacier | Included with S3 |
+| 11 | **CloudFront** | CDN + HTTPS for frontend | 1 TB, 10M req / 12 months |
+| 12 | **CloudFront Functions** | Edge auth header injection | 2M invocations/month forever |
+| 13 | **Cognito User Pool** | Auth — replaces JWT/bcrypt entirely | 50,000 MAU forever |
+| 14 | **Cognito Identity Pool** | Temporary AWS credentials for browser | Included with Cognito |
+| 15 | **SQS Standard** | Scraping job queue + DLQ | 1M req/month forever |
+| 16 | **SNS** | Email alerts + job notifications | 1M publishes/month forever |
+| 17 | **SES** | Transactional email (job reports) | 62K emails/month from Lambda |
+| 18 | **EventBridge** | Custom events (JobCreated, JobCompleted) | 1M events/month forever |
+| 19 | **EventBridge Scheduler** | Daily universe refresh, screener cron | 14M invocations/month free |
+| 20 | **EventBridge Pipes** | SQS → Lambda with filter (optional) | 5M events/month 12 months |
+| 21 | **Step Functions** | Parallel ASIN scraping (Map state) | 4,000 state transitions/month forever |
+| 22 | **SSM Parameter Store** | Secrets — JWT, DB URLs, feature flags | 10K API calls/month forever |
+| 23 | **AppConfig** | Feature flags without redeployment | Free (uses SSM) |
+| 24 | **X-Ray** | Distributed tracing all Lambda calls | 100K traces/month forever |
+| 25 | **CloudWatch Logs** | Auto log all Lambda invocations | 5 GB ingestion + storage / 12 mo |
+| 26 | **CloudWatch Metrics** | Custom metrics (queue depth, errors) | 10 detailed metrics / 12 mo |
+| 27 | **CloudWatch Alarms** | Alert on Lambda errors, DLQ depth | 10 alarms / 12 months |
+| 28 | **CloudWatch Dashboard** | Operations view per stage | 3 dashboards / 12 months |
+| 29 | **CloudWatch Logs Insights** | Query logs across functions | 5 GB queried/month / 12 mo |
+| 30 | **CloudTrail** | Audit log every API call | 1 trail, 90-day history forever |
+| 31 | **IAM** | Roles, policies, least privilege | Always free |
+| 32 | **KMS (AWS-managed keys)** | Encrypt DynamoDB, S3, SSM at rest | AWS-managed keys are free |
+| 33 | **Comprehend** | ML sentiment on NSE news | 50K units/month / 12 months |
+| 34 | **Translate** | Translate product titles to English | 2M chars/month / 12 months |
+| 35 | **Rekognition** | Moderate avatar images (no NSFW) | 5K images/month / 12 months |
+| 36 | **CodeBuild** | Build Lambda packages in AWS | 100 build min/month forever |
+| 37 | **Resource Groups + Tags** | Organize all resources by stage | Always free |
+| 38 | **Budgets** | Alert if spend > $0.50/month | 2 budgets free forever |
+| 39 | **Shield Standard** | DDoS protection on API Gateway | Always free |
+| 40 | **ACM (Certificate Manager)** | Free SSL certs for CloudFront | Always free |
+| 41 | **Lambda@Edge** | CloudFront request manipulation | 1M requests / 12 months |
 
-**Key insight:** Every access pattern uses a GSI Query, NOT a Scan.
-Scan reads the entire table — expensive in DynamoDB (costs RCU).
-GSI Query reads only matching items — efficient and within free tier.
+**Total estimated cost: $0/month (all within free tier)**
 
 ---
 
-## Free Tier Cost Estimate
+## System diagram
 
-| Service | Monthly Usage | Free Tier | Estimated Cost |
+```
+Developer  git push develop
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  GitHub Actions CI/CD (or CodeBuild)                         │
+│  ruff lint → npm build → pip install → zip → Lambda update  │
+└────────────────┬────────────────────────────────────────────┘
+                 │ aws lambda update-function-code
+                 ▼
+
+BROWSER (React SPA)
+S3 static website + CloudFront CDN + ACM SSL + Shield DDoS
+     │
+     ├─ HTTPS REST  ──────────────────────────────────────────────┐
+     │                                                            ▼
+     │                             ┌────────────────────────────────────────┐
+     │                             │   API Gateway HTTP API                  │
+     │                             │   Cognito JWT Authorizer               │
+     │                             │   Throttle: 20 req/s + burst 50        │
+     │                             │   Routes → Lambda per domain           │
+     │                             └──────────┬─────────────────────────────┘
+     │                                        │
+     │                        ┌───────────────┼────────────────┐
+     │                        ▼               ▼                ▼
+     │            Lambda: nse-auth  Lambda: nse-users  Lambda: nse-stocks
+     │            (Cognito auth)    (S3 avatars)        (yfinance + portfolio)
+     │                        │               │                │
+     │                        └───────────────┼────────────────┘
+     │                                        ▼
+     │                              DynamoDB (12 tables)
+     │                              S3 (avatars)
+     │                              SSM (secrets)
+     │                              Comprehend (AI sentiment)
+     │                              Translate (product titles)
+     │
+     ├─ WebSocket wss://  ─────────────────────────────────────┐
+     │                                                         ▼
+     │                         ┌───────────────────────────────────────────┐
+     │                         │  API Gateway WebSocket API                 │
+     │                         │  $connect / $disconnect / $default         │
+     │                         └───────────┬───────────────────────────────┘
+     │                                     ▼
+     │                         Lambda: nse-ws (connection registry)
+     │                         DynamoDB: ws_connections (TTL 2h)
+     │                                     ▲
+     │                                     │ push update
+     │                         Lambda: nse-dynamo-streams
+     │                                     ▲
+     │                                     │ triggered
+     │                         DynamoDB Streams (scraping_tasks)
+     │                                     ▲
+     └─ POST /scraping/jobs ───────────────┘
+              │
+              ▼
+         Lambda: nse-scraping
+              │
+         ┌────┴──────────────────────────────────────────┐
+         │  Option A: Step Functions (Map state)          │
+         │    → 5 parallel Lambda invocations             │
+         │    → each scrapes 1 ASIN (httpx + bs4)        │
+         │    → SNS completion notification               │
+         │                                                │
+         │  Option B: SQS queue (fallback)                │
+         │    → Lambda: nse-scraping-worker (SQS trigger) │
+         │    → On failure: DLQ → nse-dlq-alert → SNS    │
+         └────────────────────────────────────────────────┘
+
+── Scheduled background jobs ─────────────────────────────────────────────────
+EventBridge Scheduler
+  cron(0 3 * * ?)    daily 3 AM → Lambda: nse-universe-refresh
+  cron(0/30 6-16 MON-FRI) → Lambda: nse-screener-refresh
+
+EventBridge custom events
+  JobCreated / JobCompleted → Lambda: nse-ses-notifications → SES email
+
+── Monitoring ─────────────────────────────────────────────────────────────────
+X-Ray: traces every Lambda call, boto3, httpx
+CloudWatch: logs + 6 alarms + dashboard per stage
+CloudTrail: audit every AWS API call (who did what, when)
+AppConfig: feature flags (toggle Comprehend, Translate without redeploy)
+Budgets: alert if monthly bill > $0.50
+```
+
+---
+
+## What "replace FastAPI with API Gateway" means
+
+| Before | After |
+|---|---|
+| `fastapi` framework routes requests | API Gateway routes to Lambda directly |
+| `mangum` adapter translates events | No adapter — Lambda reads API GW event dict |
+| One Lambda runs ALL routes | One Lambda per domain (auth, users, stocks, scraping) |
+| JWT from `python-jose` | Cognito JWT validated by API Gateway (no Lambda code needed) |
+| bcrypt password hashing | Cognito handles all password storage and verification |
+| SSE long-polling | WebSocket API pushes state changes instantly |
+| Polling for progress | DynamoDB Streams → push to WebSocket |
+| SQS-only scraping | Step Functions Map state (parallel) + SQS fallback |
+
+---
+
+## Lambda function map
+
+| Function | Handler | Trigger | Memory/Timeout |
 |---|---|---|---|
-| EC2 t2.micro | 720 h | 750 h ✅ | $0 |
-| S3 storage | ~200 MB | 5 GB ✅ | $0 |
-| S3 requests | ~5,000 | 20K GET ✅ | $0 |
-| DynamoDB storage | ~100 MB | 25 GB ✅ | $0 |
-| DynamoDB RCU | ~500K | 25 × 2.5M ✅ | $0 |
-| API Gateway | ~10K req/mo | 1M/mo ✅ | $0 |
-| Lambda | ~1,000 runs | 1M/mo ✅ | $0 |
-| CloudWatch logs | ~1 GB | 5 GB ✅ | $0 |
-| Data transfer out | ~500 MB | 1 GB ✅ | $0 |
-| **TOTAL** | | | **$0/mo** |
-
-After 12-month free tier, estimated cost: **~$15-20/month**
+| `nse-api-{stage}` | — (API GW routes to sub-handlers) | API Gateway HTTP | 512MB / 30s |
+| `nse-auth-{stage}` | `handlers.auth.handler` | API GW `/auth/*` | 256MB / 10s |
+| `nse-users-{stage}` | `handlers.users.handler` | API GW `/users/*` | 256MB / 15s |
+| `nse-stocks-{stage}` | `handlers.stocks.handler` | API GW `/stocks/*` | 512MB / 30s |
+| `nse-scraping-{stage}` | `handlers.scraping.handler` | API GW `/scraping/*` | 256MB / 15s |
+| `nse-scraping-worker-{stage}` | `handler.lambda_handler` | SQS trigger | 256MB / 120s |
+| `nse-ws-{stage}` | `handler.handler` | WebSocket API | 256MB / 30s |
+| `nse-dynamo-streams-{stage}` | `dynamo_streams.handler` | DynamoDB Streams | 256MB / 30s |
+| `nse-ses-notifications-{stage}` | `ses_notifications.handler` | EventBridge | 256MB / 30s |
+| `nse-dlq-alert-{stage}` | `handler.lambda_handler` | SQS DLQ | 128MB / 30s |
+| `nse-screener-refresh-{stage}` | `handler.handler` | EventBridge cron | 512MB / 300s |
+| `nse-universe-refresh-{stage}` | `handler.handler` | EventBridge cron | 256MB / 300s |

@@ -1,31 +1,24 @@
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Two-stage promotion pipeline:  STAGING → PROD
+# NSE Stock Dashboard — 100% Serverless CI/CD Pipeline
 #
-# Trigger:  push to `develop`
+# No EC2. No SSH. No FastAPI framework. Pure Lambda handlers.
 #
-# Both stages run on ONE EC2 instance in ONE AWS account.
-# Isolation is enforced by DynamoDB table prefix (stg_) and separate
-# SQS queues, SNS topics, and SSM paths per stage.
+# AWS services deployed here:
+#   Lambda  (API, Worker, WebSocket, DynamoDB Streams, SES, DLQ Alert)
+#   S3      (frontend static files)
+#   CloudFront  (CDN cache invalidation)
 #
 # Flow:
-#   1. Lint & Test  — ruff + build both stage frontends
-#   2. Deploy STAGING — auto, every push
-#   3. Deploy PROD    — requires manual approval in GitHub UI
+#   push develop → [1] Lint+Build → [2] Deploy STAGING (auto) → [3] Deploy PROD (approval)
 #
-# GitHub Secrets required (Settings → Secrets → Actions):
-#   EC2_HOST              EC2 public IP (Elastic IP)
-#   EC2_SSH_KEY           Full contents of .pem key file
-#   AWS_ACCESS_KEY_ID     IAM access key
-#   AWS_SECRET_ACCESS_KEY IAM secret key
-#   S3_FRONTEND_BUCKET    nse-frontend-<account-id>
-#   STAGING_API_URL       http://<EC2_HOST>/staging/api/v1
-#   STAGING_SSE_URL       http://<EC2_HOST>
-#   PROD_API_URL          http://<EC2_HOST>/api/v1
-#   PROD_SSE_URL          http://<EC2_HOST>
+# GitHub Secrets:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   S3_FRONTEND_BUCKET
+#   STAGING_API_URL, PROD_API_URL
 #
-# GitHub Environments required (Settings → Environments):
-#   staging  — no protection rules
-#   prod     — Required reviewers: add your GitHub username
+# GitHub Environments:
+#   staging  — no protection (auto-deploy)
+#   prod     — Required reviewers: your GitHub username
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 name: Deploy Pipeline
@@ -34,31 +27,43 @@ on:
   push:
     branches: [ develop ]
   workflow_dispatch:
+    inputs:
+      stage:
+        description: 'Stage to deploy'
+        required: true
+        default: 'staging'
+        type: choice
+        options: [ staging, prod ]
 
 env:
   AWS_REGION: ap-south-1
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+  PANDAS_LAYER: "arn:aws:lambda:ap-south-1:336392948345:layer:AWSSDKPandas-Python312:16"
 
 jobs:
 
-  # ── 1. Lint & Test + build both frontends ─────────────────────────────────
-  lint-test:
-    name: Lint & Test
+  # ── 1. Lint + Build artifacts ─────────────────────────────────────────────
+  lint-build:
+    name: Lint & Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
 
-      - name: Install backend deps + lint
+      - name: Install deps + lint
         run: |
-          pip install -r backend/requirements.txt ruff -q
-          ruff check backend/app/
+          pip install ruff aws-xray-sdk -q
+          pip install -r backend/requirements.txt -q
+          ruff check backend/handlers/ backend/app/
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -66,14 +71,14 @@ jobs:
         run: npm ci
         working-directory: frontend
 
+      # Build staging frontend
       - name: Build frontend — STAGING
         run: npm run build
         working-directory: frontend
         env:
-          REACT_APP_STAGE: staging
           REACT_APP_API_URL: ${{ secrets.STAGING_API_URL }}
-          REACT_APP_SSE_URL: ${{ secrets.STAGING_SSE_URL }}
-          PUBLIC_URL: /staging
+          REACT_APP_STAGE: staging
+          PUBLIC_URL: /
           CI: false
 
       - uses: actions/upload-artifact@v4
@@ -82,13 +87,13 @@ jobs:
           path: frontend/build/
           retention-days: 1
 
+      # Build prod frontend
       - name: Build frontend — PROD
         run: npm run build
         working-directory: frontend
         env:
-          REACT_APP_STAGE: prod
           REACT_APP_API_URL: ${{ secrets.PROD_API_URL }}
-          REACT_APP_SSE_URL: ${{ secrets.PROD_SSE_URL }}
+          REACT_APP_STAGE: prod
           PUBLIC_URL: /
           CI: false
 
@@ -98,57 +103,84 @@ jobs:
           path: frontend/build/
           retention-days: 1
 
+      # ── Build API Lambda package (handlers/ + app/ + deps) ──────────────
+      - name: Build API Lambda package
+        run: |
+          BUILD=/tmp/api-lambda
+          rm -rf $BUILD && mkdir -p $BUILD
+          # Install deps (Linux x86_64 for Lambda, exclude playwright)
+          pip install -r backend/requirements.txt -t $BUILD/ -q \
+            --platform manylinux2014_x86_64 --implementation cp \
+            --python-version 3.12 --only-binary=:all: 2>/dev/null || \
+          pip install -r backend/requirements.txt -t $BUILD/ -q
+          # Copy application code
+          cp -r backend/handlers backend/app $BUILD/
+          # Remove heavy unused packages
+          rm -rf $BUILD/playwright $BUILD/playwright-* 2>/dev/null || true
+          # Strip __pycache__
+          find $BUILD -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+          find $BUILD -name "*.pyc" -delete 2>/dev/null || true
+          cd $BUILD && zip -r /tmp/api-lambda.zip . -q
+          echo "API Lambda: $(du -sh /tmp/api-lambda.zip | cut -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: api-lambda-zip
+          path: /tmp/api-lambda.zip
+          retention-days: 1
+
+      # ── Build Worker Lambda ───────────────────────────────────────────────
+      - name: Build Worker Lambda package
+        run: |
+          BUILD=/tmp/worker-lambda
+          rm -rf $BUILD && mkdir -p $BUILD
+          pip install httpx beautifulsoup4 aws-xray-sdk boto3 -t $BUILD/ -q \
+            --platform manylinux2014_x86_64 --implementation cp \
+            --python-version 3.12 --only-binary=:all: 2>/dev/null || \
+          pip install httpx beautifulsoup4 aws-xray-sdk boto3 -t $BUILD/ -q
+          cp infrastructure/lambda/scraping_worker/handler.py $BUILD/
+          find $BUILD -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+          cd $BUILD && zip -r /tmp/worker-lambda.zip . -q
+          echo "Worker Lambda: $(du -sh /tmp/worker-lambda.zip | cut -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: worker-lambda-zip
+          path: /tmp/worker-lambda.zip
+          retention-days: 1
+
+      # ── Build WebSocket + Streams Lambda ──────────────────────────────────
+      - name: Build WebSocket Lambda package
+        run: |
+          BUILD=/tmp/ws-lambda
+          rm -rf $BUILD && mkdir -p $BUILD
+          pip install aws-xray-sdk boto3 -t $BUILD/ -q \
+            --platform manylinux2014_x86_64 --implementation cp \
+            --python-version 3.12 --only-binary=:all: 2>/dev/null || \
+          pip install aws-xray-sdk boto3 -t $BUILD/ -q
+          cp backend/handlers/websocket.py $BUILD/handler.py
+          cp backend/handlers/_base.py $BUILD/
+          cp backend/handlers/dynamo_streams.py $BUILD/dynamo_streams.py
+          cp backend/handlers/ses_notifications.py $BUILD/ses_notifications.py
+          find $BUILD -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+          cd $BUILD && zip -r /tmp/ws-lambda.zip . -q
+          echo "WS Lambda: $(du -sh /tmp/ws-lambda.zip | cut -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ws-lambda-zip
+          path: /tmp/ws-lambda.zip
+          retention-days: 1
+
   # ── 2. Deploy STAGING (auto on every push) ────────────────────────────────
   deploy-staging:
     name: Deploy STAGING
-    needs: lint-test
+    needs: lint-build
     runs-on: ubuntu-latest
     environment: staging
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up SSH
-        env:
-          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-        run: |
-          mkdir -p ~/.ssh
-          printf '%s' "$SSH_KEY" | sed 's/\\n/\n/g' > ~/.ssh/nse-key.pem
-          chmod 600 ~/.ssh/nse-key.pem
-          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
-          echo "StrictHostKeyChecking no" >> ~/.ssh/config
-
-      - name: Sync backend → /opt/nse-staging
-        run: |
-          rsync -az --delete \
-            --exclude='__pycache__' --exclude='*.pyc' \
-            --exclude='.env' --exclude='worker.pid' \
-            -e "ssh -i ~/.ssh/nse-key.pem" \
-            backend/ ubuntu@${{ secrets.EC2_HOST }}:/opt/nse-staging/backend/
-
-      - name: Install deps + restart staging services
-        run: |
-          ssh -i ~/.ssh/nse-key.pem ubuntu@${{ secrets.EC2_HOST }} << 'EOF'
-            set -e
-            cd /opt/nse-staging
-            [ -d venv ] || python3 -m venv venv
-            source venv/bin/activate
-            pip install -r backend/requirements.txt -q
-            sudo systemctl restart nse-api-staging
-            sudo systemctl restart nse-worker-staging || true
-          EOF
-
-      - name: Health check — STAGING
-        run: |
-          sleep 40
-          curl -fsS "http://${{ secrets.EC2_HOST }}/staging/api/v1/health/" \
-            && echo "STAGING health check passed"
-
-      - name: Download staging frontend
-        uses: actions/download-artifact@v4
-        with:
-          name: frontend-staging
-          path: build/
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -156,66 +188,116 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Upload frontend → S3 /staging/
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/artifacts/
+
+      - name: Deploy shared Lambda Layer
         run: |
-          aws s3 sync build/static/ \
+          BUILD=/tmp/layer-build && rm -rf $BUILD && mkdir -p $BUILD/python/utils
+          pip install aws-xray-sdk -t $BUILD/python/ -q \
+            --platform manylinux2014_x86_64 --implementation cp \
+            --python-version 3.12 --only-binary=:all: 2>/dev/null || \
+          pip install aws-xray-sdk -t $BUILD/python/ -q
+          cp infrastructure/lambda/layer/python/utils/*.py $BUILD/python/utils/
+          cd $BUILD && zip -r /tmp/layer.zip python/ -q
+          LAYER_ARN=$(aws lambda publish-layer-version \
+            --layer-name nse-shared-utils \
+            --zip-file fileb:///tmp/layer.zip \
+            --compatible-runtimes python3.12 \
+            --query LayerVersionArn --output text)
+          echo "LAYER_ARN=$LAYER_ARN" >> $GITHUB_ENV
+          aws ssm put-parameter --name /nse/staging/shared-layer-arn \
+            --value "$LAYER_ARN" --type String --overwrite
+
+      - name: Deploy API Lambda — STAGING
+        run: |
+          FUNC="nse-api-staging"
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          ROLE="arn:aws:iam::${ACCOUNT}:role/NSELambdaRole"
+          ENV="Variables={STAGE=staging,AWS_REGION=${{ env.AWS_REGION }}}"
+          LAYERS="${{ env.PANDAS_LAYER }},${{ env.LAYER_ARN }}"
+          ZIP="fileb:///tmp/artifacts/api-lambda-zip/api-lambda.zip"
+          if aws lambda get-function --function-name $FUNC 2>/dev/null; then
+            aws lambda update-function-code --function-name $FUNC --zip-file $ZIP > /dev/null
+            aws lambda wait function-updated --function-name $FUNC
+            aws lambda update-function-configuration --function-name $FUNC \
+              --layers $LAYERS --environment "$ENV" --timeout 30 --memory-size 512 > /dev/null
+          else
+            aws lambda create-function --function-name $FUNC \
+              --runtime python3.12 --handler handlers.health.handler \
+              --zip-file $ZIP --role $ROLE --timeout 30 --memory-size 512 \
+              --layers $LAYERS --environment "$ENV" > /dev/null
+            aws lambda wait function-active --function-name $FUNC
+          fi
+          echo "✓ nse-api-staging deployed"
+
+      - name: Deploy Worker Lambda — STAGING
+        run: |
+          FUNC="nse-scraping-worker-staging"
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          ROLE="arn:aws:iam::${ACCOUNT}:role/NSELambdaRole"
+          ZIP="fileb:///tmp/artifacts/worker-lambda-zip/worker-lambda.zip"
+          ENV="Variables={STAGE=staging,AWS_REGION=${{ env.AWS_REGION }}}"
+          if aws lambda get-function --function-name $FUNC 2>/dev/null; then
+            aws lambda update-function-code --function-name $FUNC --zip-file $ZIP > /dev/null
+          else
+            aws lambda create-function --function-name $FUNC \
+              --runtime python3.12 --handler handler.lambda_handler \
+              --zip-file $ZIP --role $ROLE --timeout 120 --memory-size 256 \
+              --environment "$ENV" > /dev/null
+          fi
+          echo "✓ nse-scraping-worker-staging deployed"
+
+      - name: Deploy WebSocket Lambda — STAGING
+        run: |
+          FUNC="nse-ws-staging"
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          ROLE="arn:aws:iam::${ACCOUNT}:role/NSELambdaRole"
+          ZIP="fileb:///tmp/artifacts/ws-lambda-zip/ws-lambda.zip"
+          ENV="Variables={STAGE=staging,AWS_REGION=${{ env.AWS_REGION }}}"
+          if aws lambda get-function --function-name $FUNC 2>/dev/null; then
+            aws lambda update-function-code --function-name $FUNC --zip-file $ZIP > /dev/null
+          else
+            aws lambda create-function --function-name $FUNC \
+              --runtime python3.12 --handler handler.handler \
+              --zip-file $ZIP --role $ROLE --timeout 30 --memory-size 256 \
+              --environment "$ENV" > /dev/null
+          fi
+          echo "✓ nse-ws-staging deployed"
+
+      - name: Health check — STAGING
+        run: |
+          sleep 10
+          curl -fsS "${{ secrets.STAGING_API_URL }}/health/" \
+            && echo "✓ STAGING health OK" \
+            || (echo "✗ STAGING health FAILED" && exit 1)
+
+      - name: Upload frontend → S3 staging
+        run: |
+          aws s3 sync /tmp/artifacts/frontend-staging/static/ \
             s3://${{ secrets.S3_FRONTEND_BUCKET }}/staging/static/ \
             --cache-control "max-age=31536000,immutable" --delete
-          aws s3 sync build/ \
+          aws s3 sync /tmp/artifacts/frontend-staging/ \
             s3://${{ secrets.S3_FRONTEND_BUCKET }}/staging/ \
-            --cache-control "no-cache,no-store,must-revalidate" \
-            --exclude "static/*" --delete
+            --cache-control "no-cache,no-store" --exclude "static/*" --delete
 
-  # ── 3. Deploy PROD (requires approval in GitHub UI) ──────────────────────
+      - name: Invalidate CloudFront — STAGING
+        run: |
+          DIST=$(aws ssm get-parameter --name /nse/staging/cloudfront-dist-id \
+            --query Parameter.Value --output text 2>/dev/null || echo "")
+          [ -n "$DIST" ] && aws cloudfront create-invalidation \
+            --distribution-id "$DIST" --paths "/staging/*" || true
+
+  # ── 3. Deploy PROD (manual approval) ─────────────────────────────────────
   deploy-prod:
     name: Deploy PROD
     needs: deploy-staging
     runs-on: ubuntu-latest
-    environment: prod          # reviewer must approve before this job runs
+    environment: prod
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up SSH
-        env:
-          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-        run: |
-          mkdir -p ~/.ssh
-          printf '%s' "$SSH_KEY" | sed 's/\\n/\n/g' > ~/.ssh/nse-key.pem
-          chmod 600 ~/.ssh/nse-key.pem
-          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
-          echo "StrictHostKeyChecking no" >> ~/.ssh/config
-
-      - name: Sync backend → /opt/nse
-        run: |
-          rsync -az --delete \
-            --exclude='__pycache__' --exclude='*.pyc' \
-            --exclude='.env' --exclude='worker.pid' \
-            -e "ssh -i ~/.ssh/nse-key.pem" \
-            backend/ ubuntu@${{ secrets.EC2_HOST }}:/opt/nse/backend/
-
-      - name: Install deps + restart prod services
-        run: |
-          ssh -i ~/.ssh/nse-key.pem ubuntu@${{ secrets.EC2_HOST }} << 'EOF'
-            set -e
-            cd /opt/nse
-            source venv/bin/activate
-            pip install -r backend/requirements.txt -q
-            sudo systemctl restart nse-worker
-            sleep 3
-            sudo systemctl restart nse-api
-          EOF
-
-      - name: Health check — PROD
-        run: |
-          sleep 40
-          curl -fsS "http://${{ secrets.EC2_HOST }}/api/v1/health/" \
-            && echo "PROD health check passed"
-
-      - name: Download prod frontend
-        uses: actions/download-artifact@v4
-        with:
-          name: frontend-prod
-          path: build/
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -224,20 +306,51 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Upload frontend → S3 root (prod)
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/artifacts/
+
+      - name: Deploy API Lambda — PROD
         run: |
-          aws s3 sync build/static/ \
+          FUNC="nse-api-prod"
+          LAYER=$(aws ssm get-parameter --name /nse/prod/shared-layer-arn \
+            --query Parameter.Value --output text 2>/dev/null || echo "")
+          LAYERS="${{ env.PANDAS_LAYER }}${LAYER:+,$LAYER}"
+          ZIP="fileb:///tmp/artifacts/api-lambda-zip/api-lambda.zip"
+          aws lambda update-function-code --function-name $FUNC --zip-file $ZIP > /dev/null
+          aws lambda wait function-updated --function-name $FUNC
+          aws lambda update-function-configuration --function-name $FUNC \
+            --layers $LAYERS --environment "Variables={STAGE=prod,AWS_REGION=${{ env.AWS_REGION }}}" > /dev/null
+          echo "✓ nse-api-prod deployed"
+
+      - name: Deploy Worker + WS Lambda — PROD
+        run: |
+          for FUNC_ZIP in "nse-scraping-worker-prod:worker-lambda-zip/worker-lambda.zip" "nse-ws-prod:ws-lambda-zip/ws-lambda.zip"; do
+            FUNC="${FUNC_ZIP%%:*}"; ZIP="${FUNC_ZIP#*:}"
+            aws lambda update-function-code --function-name $FUNC \
+              --zip-file "fileb:///tmp/artifacts/${ZIP}" > /dev/null 2>/dev/null || true
+            echo "✓ $FUNC deployed"
+          done
+
+      - name: Health check — PROD
+        run: |
+          sleep 10
+          curl -fsS "${{ secrets.PROD_API_URL }}/health/" \
+            && echo "✓ PROD health OK" || (echo "✗ PROD FAILED" && exit 1)
+
+      - name: Upload frontend → S3 prod
+        run: |
+          aws s3 sync /tmp/artifacts/frontend-prod/static/ \
             s3://${{ secrets.S3_FRONTEND_BUCKET }}/static/ \
             --cache-control "max-age=31536000,immutable" --delete
-          aws s3 sync build/ \
+          aws s3 sync /tmp/artifacts/frontend-prod/ \
             s3://${{ secrets.S3_FRONTEND_BUCKET }}/ \
-            --cache-control "no-cache,no-store,must-revalidate" \
-            --exclude "static/*" --delete
+            --cache-control "no-cache,no-store" --exclude "static/*" --delete
 
-      - name: Invalidate CloudFront cache
+      - name: Invalidate CloudFront — PROD
         run: |
-          DIST_ID=$(aws ssm get-parameter \
-            --name "/nse/cloudfront-dist-id" \
-            --query "Parameter.Value" --output text 2>/dev/null || echo "")
-          [ -n "$DIST_ID" ] && aws cloudfront create-invalidation \
-            --distribution-id "$DIST_ID" --paths "/*" || true
+          DIST=$(aws ssm get-parameter --name /nse/prod/cloudfront-dist-id \
+            --query Parameter.Value --output text 2>/dev/null || echo "")
+          [ -n "$DIST" ] && aws cloudfront create-invalidation \
+            --distribution-id "$DIST" --paths "/*" || true

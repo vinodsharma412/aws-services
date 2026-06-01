@@ -1,81 +1,74 @@
-import { useEffect, useRef, useState } from 'react';
-import { API_URL, TOKEN_KEY } from '../utils/constants';
-
 /**
- * Subscribe to a backend SSE endpoint.
+ * usePolling — polling replacement for the previous SSE hook.
  *
- * @param {string|null} path  - e.g. "/scraping/events". Pass null to disable.
- * @param {*}           init  - initial value for `data`
- * @returns {{ data: *, connected: boolean }}
+ * Why polling instead of SSE:
+ *   API Gateway + Lambda enforces a hard 29-second response timeout.
+ *   SSE (Server-Sent Events) requires a long-lived connection that would be
+ *   killed at 29 seconds.  Polling every 2 seconds is simpler, works through
+ *   API Gateway, and has minimal DynamoDB cost (< 1 RCU per poll).
+ *
+ * Usage (drop-in replacement for the old useSSE hook):
+ *   const { data, connected } = usePolling('/scraping/jobs', null, 2000);
+ *   // data: latest JSON from the endpoint (or null on error)
+ *   // connected: true while polling is active
+ *
+ * Polling stops automatically when:
+ *   - path is set to null
+ *   - the component unmounts
+ *   - no active jobs remain (pending + running === 0) — pass a check function
+ *
+ * @param {string|null}  path          API path, e.g. "/scraping/jobs"
+ * @param {*}            init          Initial value for `data`
+ * @param {number}       intervalMs    Polling interval in ms (default 2000)
+ * @param {function}     shouldStop    Optional: (data) => boolean — stop when true
  */
-export default function useSSE(path, init = null) {
+import { useCallback, useEffect, useRef, useState } from 'react';
+import api from '../services/api';
+
+export default function usePolling(path, init = null, intervalMs = 2000, shouldStop = null) {
   const [data,      setData]      = useState(init);
   const [connected, setConnected] = useState(false);
-  const abortRef  = useRef(null);
+  const timerRef  = useRef(null);
   const activeRef = useRef(false);
+
+  const poll = useCallback(async () => {
+    if (!activeRef.current || !path) return;
+
+    try {
+      const res = await api.get(path);
+      setData(res.data);
+      setConnected(true);
+
+      // Stop polling when all jobs are complete (no pending/running)
+      if (shouldStop && shouldStop(res.data)) {
+        activeRef.current = false;
+        setConnected(false);
+        return;
+      }
+    } catch {
+      setConnected(false);
+    }
+
+    if (activeRef.current) {
+      timerRef.current = setTimeout(poll, intervalMs);
+    }
+  }, [path, intervalMs, shouldStop]);
 
   useEffect(() => {
     if (!path) return;
 
     activeRef.current = true;
-    abortRef.current  = new AbortController();
-
-    async function connect() {
-      const token = localStorage.getItem(TOKEN_KEY);
-      const url   = `${API_URL}${path}`;
-
-      try {
-        const resp = await fetch(url, {
-          headers: { Authorization: token ? `Bearer ${token}` : '' },
-          signal:  abortRef.current.signal,
-        });
-
-        if (!resp.ok || !resp.body) {
-          scheduleReconnect();
-          return;
-        }
-
-        setConnected(true);
-        const reader  = resp.body.getReader();
-        const decoder = new TextDecoder();
-        let   buf     = '';
-
-        while (activeRef.current) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buf += decoder.decode(value, { stream: true });
-
-          // SSE frames are separated by double newlines
-          const frames = buf.split('\n\n');
-          buf = frames.pop();           // keep trailing incomplete frame
-
-          for (const frame of frames) {
-            const line = frame.split('\n').find(l => l.startsWith('data: '));
-            if (line) {
-              try { setData(JSON.parse(line.slice(6))); } catch { /* ignore */ }
-            }
-          }
-        }
-      } catch (err) {
-        if (!activeRef.current) return; // intentional abort — don't reconnect
-        scheduleReconnect();
-      } finally {
-        setConnected(false);
-      }
-    }
-
-    function scheduleReconnect() {
-      if (activeRef.current) setTimeout(connect, 3000);
-    }
-
-    connect();
+    poll();
 
     return () => {
       activeRef.current = false;
-      abortRef.current?.abort();
+      if (timerRef.current) clearTimeout(timerRef.current);
+      setConnected(false);
     };
-  }, [path]);
+  }, [path, poll]);
 
   return { data, connected };
 }
+
+// Named export kept for backward compatibility with any direct import of useSSE
+export { usePolling as useSSE };

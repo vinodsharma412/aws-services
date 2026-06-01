@@ -1,0 +1,76 @@
+{
+  "Comment": "NSE Scraping Workflow — parallel ASIN scraping with error handling",
+  "StartAt": "ProcessAllASINs",
+  "States": {
+    "ProcessAllASINs": {
+      "Type": "Map",
+      "Comment": "Fan-out: scrape each ASIN in parallel (up to 5 concurrent)",
+      "ItemsPath": "$.tasks",
+      "MaxConcurrency": 5,
+      "Parameters": {
+        "task_id.$": "$$.Map.Item.Value.task_id",
+        "asin.$": "$$.Map.Item.Value.asin",
+        "job_id.$": "$.job_id"
+      },
+      "Iterator": {
+        "StartAt": "ScrapeASIN",
+        "States": {
+          "ScrapeASIN": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${ScrapingWorkerArn}",
+              "Payload": {
+                "Records": [
+                  {
+                    "body.$": "States.Format('{{\"task_id\":\"{}\"}}', $.task_id)",
+                    "messageId": "stepfunctions-direct"
+                  }
+                ]
+              }
+            },
+            "ResultPath": "$.scrape_result",
+            "Retry": [
+              {
+                "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 2,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "Next": "RecordFailure",
+                "ResultPath": "$.error"
+              }
+            ],
+            "End": true
+          },
+          "RecordFailure": {
+            "Type": "Pass",
+            "Result": {"status": "failed"},
+            "ResultPath": "$.scrape_result",
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.results",
+      "Next": "PublishCompletion"
+    },
+    "PublishCompletion": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${AlertsTopicArn}",
+        "Subject": "Scraping job complete",
+        "Message.$": "States.Format('Job {} complete. Results: {}', $.job_id, States.JsonToString($.results))"
+      },
+      "ResultPath": "$.sns_result",
+      "Next": "JobDone"
+    },
+    "JobDone": {
+      "Type": "Succeed"
+    }
+  }
+}

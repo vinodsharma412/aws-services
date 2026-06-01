@@ -1,23 +1,24 @@
-"""FastAPI application factory — AWS / DynamoDB edition.
+"""FastAPI application factory — fully serverless AWS edition.
 
-Differences from the original PostgreSQL version:
-- No SQLAlchemy engine or ``Base.metadata.create_all`` — DynamoDB tables are
-  managed by ``infrastructure/dynamodb/create_tables.py``.
-- No ORM model imports (no ``app.models.*``).
-- The scraping worker subprocess is still spawned on startup so that stock
-  data fetching and Playwright scraping work the same way on EC2.
-- Avatar images are served from S3 (public URL), not from a local ``/static``
-  mount — so ``StaticFiles`` is removed.
+Deployment model:
+    Local dev  → uvicorn  (hot-reload, no Lambda needed)
+    AWS        → Lambda + Mangum  (see backend/lambda_handler.py)
+
+What changed from the EC2 version:
+    - No subprocess.Popen for the Playwright worker.
+      The scraping worker now runs as a separate SQS-triggered Lambda
+      (infrastructure/lambda/scraping_worker/handler.py).
+    - No StaticFiles mount (avatars live in S3).
+    - No EC2/Nginx references.
+    - lifespan context manager kept for future hooks but is a no-op on Lambda
+      (Mangum is called with lifespan='off').
 
 CORS policy:
-  ``allow_origins=["*"]`` is acceptable here because the S3 frontend URL is
-  not a secret. In production, replace with the exact CloudFront or S3 URL.
+    allow_origins=["*"] is fine here — the S3/CloudFront URL is public.
+    In production you can restrict to your CloudFront distribution domain.
 """
 
-import subprocess
-import sys
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,33 +27,15 @@ from app.api.v1.router import api_router
 from app.config import settings
 from app.middleware.logging_middleware import LoggingMiddleware
 
-_WORKER_SCRIPT = Path(__file__).resolve().parent / "worker.py"
-
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Manage startup and shutdown tasks.
-
-    On startup:
-    - Spawns the Playwright scraping worker as a separate OS process.
-
-    On shutdown (``finally`` block):
-    - Sends ``SIGTERM`` to the worker.
-
-    The worker is launched via ``shell=True`` so that debugpy (the VS Code
-    debugger) does not intercept and instrument the child process.
-    """
-    worker = None
-    if _WORKER_SCRIPT.exists():
-        cmd = f'exec "{sys.executable}" "{_WORKER_SCRIPT}"'
-        worker = subprocess.Popen(cmd, shell=True, start_new_session=True)
-    try:
-        yield
-    finally:
-        if worker:
-            worker.terminate()
+    """Application lifespan — no-op on Lambda, kept for local dev hooks."""
+    yield
 
 
+# On Lambda the stage prefix is handled by API Gateway; locally we keep it
+# so the OpenAPI docs URL matches the real endpoint paths.
 _root_path = "" if settings.STAGE == "prod" else f"/{settings.STAGE}"
 
 app = FastAPI(

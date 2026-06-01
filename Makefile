@@ -1,68 +1,79 @@
 # ══════════════════════════════════════════════════════════════════════════════
-#  NSE Stock Dashboard — developer workflow commands
+#  NSE Stock Dashboard — 100% Serverless AWS (40+ services, zero EC2)
 #
-#  Quick start (local):
-#    make local-backend     ← FastAPI on http://localhost:9000/docs
-#    make local-frontend    ← React  on http://localhost:3000
+#  QUICK START (local dev):
+#    make local-backend      FastAPI on localhost:9000 (for dev only)
+#    make local-frontend     React  on localhost:3000
 #
-#  Operations on AWS:
-#    make logs              ← tail staging API logs  (STAGE=prod for prod)
-#    make logs-worker       ← tail staging worker logs
-#    make restart           ← restart staging services (STAGE=prod for prod)
-#    make health            ← run health checks for both stages
-#    make ssh               ← SSH shell to EC2
-#    make test-staging      ← run automated API smoke tests against staging
+#  ONE-TIME INFRA SETUP (run once per stage):
+#    make setup-all STAGE=staging EMAIL=you@email.com
+#    make setup-all STAGE=prod    EMAIL=you@email.com
 #
-#  Infrastructure (one-time per stage):
-#    make dynamo-tables STAGE=staging
-#    make dynamo-tables STAGE=prod
+#  DEPLOY (after every code change):
+#    make deploy STAGE=staging    → Lambda + S3 frontend
+#    make deploy STAGE=prod
+#
+#  MONITOR:
+#    make logs STAGE=staging      CloudWatch live logs
+#    make logs-worker             Worker Lambda logs
+#    make health                  Health check both stages
+#    make xray                    Open X-Ray trace console
+#
+#  AWS SERVICES USED (free tier):
+#    API Gateway (HTTP + WebSocket) · Lambda · DynamoDB · DynamoDB Streams
+#    S3 · CloudFront · Cognito · SQS · SNS · EventBridge · Step Functions
+#    SES · SSM · AppConfig · X-Ray · CloudWatch · CloudTrail · IAM · KMS
+#    Comprehend · Translate · Rekognition · CodeBuild · Resource Groups
+#    Budgets · Lambda Layers · CloudFront Functions · Shield Standard
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Config ────────────────────────────────────────────────────────────────────
-STAGE    ?= staging
-EC2_HOST ?= $(shell cat .ec2-host 2>/dev/null || echo "SET_EC2_HOST")
-EC2_USER ?= ubuntu
-SSH_KEY  ?= ~/.ssh/nse-key.pem
-SSH      := ssh -i $(SSH_KEY) -o StrictHostKeyChecking=no $(EC2_USER)@$(EC2_HOST)
+STAGE  ?= staging
+REGION ?= ap-south-1
+EMAIL  ?= set-your@email.com
 
-# Remote dir: staging → /opt/nse-staging,  prod → /opt/nse
-REMOTE_DIR := $(if $(filter prod,$(STAGE)),/opt/nse,/opt/nse-$(STAGE))
+# Function names derived from stage
+FUNCS := nse-api nse-scraping-worker nse-ws nse-dynamo-streams nse-ses-notifications
 
-# Systemd service names
-API_SVC    := $(if $(filter prod,$(STAGE)),nse-api,nse-api-$(STAGE))
-WORKER_SVC := $(if $(filter prod,$(STAGE)),nse-worker,nse-worker-$(STAGE))
-
-# Health check URL prefix
-HEALTH_PREFIX := $(if $(filter prod,$(STAGE)),,/$(STAGE))
-
-S3_BUCKET ?= $(shell grep S3_FRONTEND_BUCKET backend/.env 2>/dev/null | cut -d= -f2)
+# Read from SSM (no hardcoded values)
+STAGING_API_URL := $(shell aws ssm get-parameter --name /nse/staging/api-gateway-url \
+  --query Parameter.Value --output text 2>/dev/null || echo "")
+PROD_API_URL    := $(shell aws ssm get-parameter --name /nse/prod/api-gateway-url \
+  --query Parameter.Value --output text 2>/dev/null || echo "")
+S3_BUCKET       := $(shell aws ssm get-parameter --name /nse/$(STAGE)/s3-frontend-bucket \
+  --query Parameter.Value --output text 2>/dev/null || echo "SET_BUCKET")
 
 .PHONY: help local-backend local-frontend install-backend install-frontend \
-        deploy deploy-frontend deploy-all logs logs-worker restart health ssh \
-        test-staging dynamo-tables setup-infra lint
+        deploy deploy-layer deploy-api deploy-worker deploy-ws deploy-frontend \
+        setup-all setup-iam setup-s3 setup-dynamo setup-cognito setup-sqs \
+        setup-sns setup-ssm setup-stepfunctions setup-websocket setup-ses \
+        setup-appconfig setup-kms setup-eventbridge setup-cloudwatch \
+        setup-cloudfront setup-codebuild setup-budget setup-tags \
+        logs logs-worker logs-ws health xray dynamo-tables lint
 
-# ── Help ──────────────────────────────────────────────────────────────────────
 help:
 	@echo ""
-	@echo "  NSE Stock Dashboard — developer commands"
+	@echo "  NSE Stock Dashboard — 40+ AWS Free-Tier Services"
 	@echo ""
-	@echo "  LOCAL DEVELOPMENT"
-	@echo "    make install-backend    Install Python dependencies"
-	@echo "    make install-frontend   Install Node dependencies"
-	@echo "    make local-backend      FastAPI on http://localhost:9000/docs"
-	@echo "    make local-frontend     React  on http://localhost:3000"
+	@echo "  LOCAL"
+	@echo "    make local-backend    FastAPI on localhost:9000 (dev mode)"
+	@echo "    make local-frontend   React on localhost:3000"
 	@echo ""
-	@echo "  OPERATIONS  (add STAGE=prod to target prod)"
-	@echo "    make logs               Tail API logs from EC2"
-	@echo "    make logs-worker        Tail worker logs from EC2"
-	@echo "    make restart            Restart API + worker"
-	@echo "    make health             Health check both stages"
-	@echo "    make ssh                SSH shell to EC2"
-	@echo "    make test-staging       Automated API smoke tests"
+	@echo "  ONE-TIME SETUP  (add STAGE=prod for prod)"
+	@echo "    make setup-all STAGE=staging EMAIL=you@email.com"
 	@echo ""
-	@echo "  INFRASTRUCTURE (one-time)"
-	@echo "    make dynamo-tables STAGE=staging"
-	@echo "    make dynamo-tables STAGE=prod"
+	@echo "  DEPLOY"
+	@echo "    make deploy STAGE=staging      Full deploy (Lambda + frontend)"
+	@echo "    make deploy-layer              Deploy shared Lambda Layer"
+	@echo "    make deploy-api                Deploy API Lambda only"
+	@echo "    make deploy-worker             Deploy scraping worker"
+	@echo "    make deploy-ws                 Deploy WebSocket Lambda"
+	@echo "    make deploy-frontend           Build React + upload to S3"
+	@echo ""
+	@echo "  MONITOR"
+	@echo "    make logs STAGE=staging        Live API Lambda logs"
+	@echo "    make logs-worker               Worker Lambda logs"
+	@echo "    make health                    Curl both stage health endpoints"
+	@echo "    make xray                      Open X-Ray service map URL"
 	@echo ""
 
 # ── Local development ─────────────────────────────────────────────────────────
@@ -74,71 +85,145 @@ install-frontend:
 
 local-backend:
 	@echo "→ FastAPI on http://localhost:9000/docs  (STAGE=staging)"
+	@echo "  Note: In production, API Gateway routes directly to Lambda handlers"
 	cd backend && STAGE=staging uvicorn app.main:app --reload --host 0.0.0.0 --port 9000
 
 local-frontend:
-	@echo "→ React on http://localhost:3000"
 	cd frontend && npm start
 
-# ── Deploy to AWS ─────────────────────────────────────────────────────────────
-deploy:
-	@echo "→ Deploying $(STAGE) backend to $(EC2_HOST):$(REMOTE_DIR)"
-	rsync -az --delete \
-		--exclude='__pycache__' --exclude='*.pyc' \
-		--exclude='.env' --exclude='worker.pid' \
-		-e "ssh -i $(SSH_KEY) -o StrictHostKeyChecking=no" \
-		backend/ $(EC2_USER)@$(EC2_HOST):$(REMOTE_DIR)/backend/
-	$(SSH) "cd $(REMOTE_DIR) && source venv/bin/activate && \
-		pip install -r backend/requirements.txt -q && \
-		sudo systemctl restart $(API_SVC) $(WORKER_SVC)"
-	@echo "✓ $(STAGE) deployed"
+# ── Deploy all Lambdas ────────────────────────────────────────────────────────
+deploy: deploy-layer deploy-api deploy-worker deploy-ws deploy-frontend
+	@echo "✓ Full $(STAGE) deploy complete"
+
+deploy-layer:
+	bash infrastructure/lambda/layer/deploy.sh $(STAGE)
+
+deploy-api:
+	bash infrastructure/lambda/api/deploy.sh $(STAGE)
+
+deploy-worker:
+	bash infrastructure/lambda/scraping_worker/deploy.sh $(STAGE)
+
+deploy-ws:
+	bash infrastructure/websocket/setup_websocket_api.sh $(STAGE)
 
 deploy-frontend:
-	@echo "→ Building and uploading $(STAGE) frontend"
-	@bash infrastructure/scripts/frontend_deploy.sh $(STAGE) $(S3_BUCKET)
+	bash infrastructure/scripts/frontend_deploy.sh $(STAGE) $(S3_BUCKET)
 
-deploy-all: deploy deploy-frontend
-
-# ── Operations ────────────────────────────────────────────────────────────────
+# ── Monitor ───────────────────────────────────────────────────────────────────
 logs:
-	@echo "→ $(API_SVC) logs (Ctrl+C to stop)"
-	$(SSH) "sudo journalctl -u $(API_SVC) -f --no-hostname -o short-iso"
+	@echo "→ CloudWatch logs: nse-api-$(STAGE)"
+	aws logs tail /aws/lambda/nse-api-$(STAGE) --follow --region $(REGION)
 
 logs-worker:
-	@echo "→ $(WORKER_SVC) logs (Ctrl+C to stop)"
-	$(SSH) "sudo journalctl -u $(WORKER_SVC) -f --no-hostname -o short-iso"
+	aws logs tail /aws/lambda/nse-scraping-worker-$(STAGE) --follow --region $(REGION)
 
-restart:
-	$(SSH) "sudo systemctl restart $(API_SVC) $(WORKER_SVC)"
-	@echo "✓ $(STAGE) services restarted"
+logs-ws:
+	aws logs tail /aws/lambda/nse-ws-$(STAGE) --follow --region $(REGION)
 
 health:
-	@echo "→ Staging health:"
-	@curl -fsS "http://$(EC2_HOST)/staging/api/v1/health/" && echo " ✓ staging OK" || echo " ✗ staging FAIL"
-	@echo "→ Prod health:"
-	@curl -fsS "http://$(EC2_HOST)/api/v1/health/"         && echo " ✓ prod OK"    || echo " ✗ prod FAIL"
+	@echo "→ Staging:"; \
+	  [ -n "$(STAGING_API_URL)" ] && \
+	  curl -fsS "$(STAGING_API_URL)/api/v1/health/" && echo " ✓" || echo " ✗ URL not set"
+	@echo "→ Prod:"; \
+	  [ -n "$(PROD_API_URL)" ] && \
+	  curl -fsS "$(PROD_API_URL)/api/v1/health/" && echo " ✓" || echo " ✗ URL not set"
 
-ssh:
-	$(SSH)
+xray:
+	@echo "→ X-Ray Service Map:"
+	@echo "  https://$(REGION).console.aws.amazon.com/xray/home#/service-map"
 
-test-staging:
-	@echo "→ Running staging smoke tests..."
-	@bash infrastructure/scripts/test_staging.sh $(EC2_HOST)
+# ── Infrastructure setup ──────────────────────────────────────────────────────
+setup-all:
+	@echo "═══════════════════════════════════════════════"
+	@echo "  Full infrastructure setup — STAGE=$(STAGE)"
+	@echo "═══════════════════════════════════════════════"
+	$(MAKE) setup-iam
+	$(MAKE) setup-s3
+	$(MAKE) setup-dynamo
+	$(MAKE) setup-sqs
+	$(MAKE) setup-sns
+	$(MAKE) setup-ssm
+	$(MAKE) setup-cognito
+	$(MAKE) deploy-layer
+	$(MAKE) deploy-api
+	$(MAKE) deploy-worker
+	$(MAKE) setup-apigateway
+	$(MAKE) setup-stepfunctions
+	$(MAKE) setup-websocket
+	$(MAKE) setup-ses
+	$(MAKE) setup-appconfig
+	$(MAKE) setup-kms
+	$(MAKE) setup-eventbridge
+	$(MAKE) setup-cloudwatch
+	$(MAKE) setup-cloudfront
+	$(MAKE) setup-budget
+	$(MAKE) setup-tags
+	@echo "═══════════════════════════════════════════════"
+	@echo "  ✓ All $(STAGE) infrastructure ready!"
+	@echo "═══════════════════════════════════════════════"
 
-# ── Infrastructure (one-time per stage) ──────────────────────────────────────
-dynamo-tables:
-	@echo "→ Creating DynamoDB tables for STAGE=$(STAGE)"
-	STAGE=$(STAGE) python3 infrastructure/dynamodb/create_tables.py
+setup-iam:
+	bash infrastructure/iam/setup_lambda_role.sh
 
-setup-infra:
-	@echo "→ Full infra setup for STAGE=$(STAGE)"
-	bash infrastructure/iam/setup_ec2_role.sh
+setup-s3:
 	bash infrastructure/scripts/s3_setup.sh
-	STAGE=$(STAGE) python3 infrastructure/dynamodb/create_tables.py
-	bash infrastructure/ssm/setup_ssm.sh $(STAGE)
+
+setup-dynamo:
+	STAGE=$(STAGE) AWS_REGION=$(REGION) python3 infrastructure/dynamodb/create_tables.py
+
+setup-sqs:
 	bash infrastructure/sqs/setup_sqs.sh $(STAGE)
+
+setup-sns:
 	bash infrastructure/sns/setup_sns.sh $(STAGE) $(EMAIL)
 
-# ── Code quality ──────────────────────────────────────────────────────────────
+setup-ssm:
+	bash infrastructure/ssm/setup_ssm.sh $(STAGE)
+
+setup-cognito:
+	bash infrastructure/cognito/setup_cognito.sh $(STAGE) $(EMAIL)
+
+setup-apigateway:
+	bash infrastructure/scripts/api_gateway_setup.sh $(STAGE)
+
+setup-stepfunctions:
+	bash infrastructure/stepfunctions/setup_stepfunctions.sh $(STAGE)
+
+setup-websocket:
+	bash infrastructure/websocket/setup_websocket_api.sh $(STAGE)
+
+setup-ses:
+	bash infrastructure/ses/setup_ses.sh $(STAGE) $(EMAIL)
+
+setup-appconfig:
+	bash infrastructure/appconfig/setup_appconfig.sh $(STAGE)
+
+setup-kms:
+	bash infrastructure/kms/setup_kms.sh $(STAGE)
+
+setup-eventbridge:
+	bash infrastructure/eventbridge/setup_eventbridge.sh $(STAGE)
+
+setup-cloudwatch:
+	@API_GW_ID=$$(aws ssm get-parameter --name /nse/$(STAGE)/api-gateway-id \
+	  --query Parameter.Value --output text 2>/dev/null || echo ""); \
+	bash infrastructure/cloudwatch/setup_alarms.sh $(STAGE) "$${API_GW_ID}"
+
+setup-cloudfront:
+	bash infrastructure/cloudfront/setup_cloudfront.sh $(STAGE)
+
+setup-codebuild:
+	bash infrastructure/codebuild/setup_codebuild.sh $(STAGE)
+
+setup-budget:
+	bash infrastructure/scripts/setup_budget.sh $(EMAIL)
+
+setup-tags:
+	bash infrastructure/scripts/setup_resource_groups.sh $(STAGE)
+
+dynamo-tables:
+	STAGE=$(STAGE) AWS_REGION=$(REGION) python3 infrastructure/dynamodb/create_tables.py
+
 lint:
-	cd backend && python -m ruff check app/ --fix
+	ruff check backend/handlers/ backend/app/ --fix

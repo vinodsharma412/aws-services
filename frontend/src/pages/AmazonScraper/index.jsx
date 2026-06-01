@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { scrapingService } from '../../services/scrapingService';
-import useSSE from '../../hooks/useSSE';
+import usePolling from '../../hooks/useSSE';  // polling replaces SSE (API GW 29 s limit)
 import usePagination from '../../hooks/usePagination';
 import Pagination from '../../components/common/Pagination';
 
@@ -99,11 +99,15 @@ function DetailModal({ jobId, onClose }) {
       .finally(() => setLoading(false));
   }, [jobId]);
 
-  // ② SSE: stream live updates on top
-  const { data: sseJob } = useSSE(`/scraping/jobs/${jobId}/events`);
+  // ② Polling: refresh every 2 s while job is active, stop when done
+  const isDone = (d) => d && d.pending === 0 && d.running === 0;
+  const { data: polledJob } = usePolling(
+    job && !isDone(job) ? `/scraping/jobs/${jobId}` : null,
+    null, 2000, isDone,
+  );
   useEffect(() => {
-    if (sseJob && !sseJob.error) setJob(sseJob);
-  }, [sseJob]);
+    if (polledJob && !polledJob.error) setJob(polledJob);
+  }, [polledJob]);
 
   const isActive = job && (job.pending > 0 || job.running > 0);
 
@@ -274,11 +278,12 @@ export default function AmazonScraper() {
   const [detailId,  setDetailId]    = useState(null);
   const pg                          = usePagination(10);
 
-  // SSE stream — one persistent connection, no polling
-  const { data: jobs, connected } = useSSE('/scraping/events', []);
+  // Poll /scraping/jobs every 2 s while any job is active
+  const hasActiveJobs = (list) => Array.isArray(list) && list.some(j => j.pending > 0 || j.running > 0);
+  const { data: jobs, connected } = usePolling('/scraping/jobs', [], 2000);
 
   const safeJobs  = Array.isArray(jobs) ? jobs : [];
-  const hasActive = safeJobs.some(j => j.pending > 0 || j.running > 0);
+  const hasActive = hasActiveJobs(safeJobs);
   const isViewer  = user?.role === 'viewer';
 
   const { pageRows, totalRows, totalPages, currentPage, start, end } = pg.paginate(safeJobs);
